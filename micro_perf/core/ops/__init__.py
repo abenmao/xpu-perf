@@ -94,6 +94,7 @@ SUPPORTED_OPS = {
         "head_rms_norm": HeadRMSNormOp,
         "head_rms_norm_dynamic_quant": HeadRMSNormDynamicQuantOp,
         "rotary_embedding": RotaryEmbeddingOp,
+        "multimodal_rotary_embedding": MultimodalRotaryEmbeddingOp,
         "store_kv_cache": StoreKVCacheOp,
         "store_paged_kv_cache": StoreKVCacheOp,  # INTEL custom, overridden by backend
         "dequant_kv_cache": StoreKVCacheOp,  # INTEL custom, overridden by backend

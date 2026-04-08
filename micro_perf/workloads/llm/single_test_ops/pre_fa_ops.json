@@ -32,6 +32,37 @@
             ]
         }
     ], 
+    "multimodal_rotary_embedding": [
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "bfloat16",
+            "q_head_num.kv_head_num.head_dim": [
+                [80, 8, 128]
+            ],
+            "rope_dim": 128,
+            "mrope_section": [[16, 24, 24]],
+            "batch_size.cache_len.q_len": [
+                [1, 0, 10240],
+                [1, 5120, 5120],
+                [1, 0, 32768]
+            ]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "decode",
+            "dtype": "bfloat16",
+            "q_head_num.kv_head_num.head_dim": [
+                [80, 8, 128]
+            ],
+            "rope_dim": 128,
+            "mrope_section": [[16, 24, 24]],
+            "batch_size.cache_len.q_len": [
+                [16, 10240, 1],
+                [16, 10240, 4]
+            ]
+        }
+    ],
     "store_kv_cache": [
         {
             "arg_type": "llm", 

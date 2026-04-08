@@ -877,6 +877,99 @@ class RotaryEmbeddingOp(BasicOp):
 
 
 @register_base_impl
+class MultimodalRotaryEmbeddingOp(BasicOp):
+    def __init__(self, args_dict, backend, *args, **kwargs):
+        super().__init__(args_dict, backend, *args, **kwargs)
+
+    def prepare(self):
+        self.arg_type = self.args_dict["arg_type"]
+        if not self.arg_type in ["llm", "batch_llm"]:
+            raise ValueError
+
+        self.attn_mode = self.args_dict.get("attn_mode", "prefill")
+        if not self.attn_mode in ["prefill", "decode"]:
+            raise ValueError
+        get_attn_info(self.arg_type, self.attn_mode, self.args_dict, self)
+
+        # pre-defined attrs
+        self.q_head_num = self.args_dict["q_head_num"]
+        self.kv_head_num = self.args_dict["kv_head_num"]
+        self.head_dim = self.args_dict["head_dim"]
+        self.rope_dim = self.args_dict["rope_dim"]
+        self.mrope_section = self.args_dict["mrope_section"]  # list of ints
+        self.num_mrope_sections = len(self.mrope_section)
+
+        self.dtype = self.args_dict.get("dtype", "bfloat16")
+
+        self.vendor_parser()
+        self.vendor_impl()
+
+    def vendor_parser(self):
+        if self.dtype != "bfloat16":
+            raise ValueError("MultimodalRotaryEmbeddingOp only support bfloat16 dtype")
+
+    def vendor_impl(self):
+        self.torch_dtype = get_torch_dtype(self.dtype)
+
+        self.input_tensor_info = {}
+        self.output_tensor_info = {}
+
+        self.input_tensor_info["q"] = OpTensorInfo(
+            shape=[self.num_tokens, self.q_head_num, self.head_dim],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+        self.input_tensor_info["k"] = OpTensorInfo(
+            shape=[self.num_tokens, self.kv_head_num, self.head_dim],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # positions: [num_mrope_sections, num_tokens]
+        positions_list = []
+        for _ in range(self.num_mrope_sections):
+            sec_positions = []
+            for batch_idx in range(self.batch_size):
+                q_len = self.q_lens[batch_idx]
+                cache_len = self.cache_lens[batch_idx]
+                sec_positions.extend(range(cache_len, cache_len + q_len))
+            positions_list.append(sec_positions)
+        self._positions = torch.tensor(positions_list, dtype=torch.long)
+
+        self.input_tensor_info["positions"] = OpTensorInfo(
+            shape=[self.num_mrope_sections, self.num_tokens],
+            dtype=torch.long,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: self._positions.to(
+                dtype=dtype, device=device
+            ),
+        )
+
+        # calculator
+        self.input_tensor_size = sum([calc_tensor_size(info) for info in self.input_tensor_info.values()])
+        self.output_tensor_size = 0
+        self.tensor_size = self.input_tensor_size
+
+        self.read_bytes = self.input_tensor_size
+        self.write_bytes = (
+            calc_tensor_size(self.input_tensor_info["q"])
+            + calc_tensor_size(self.input_tensor_info["k"])
+        )
+        self.io_bytes = self.read_bytes + self.write_bytes
+
+        self._create_tensors_func = partial(
+            self._create_in_out_tensors,
+            create_inputs=True,
+            create_outputs=False,
+        )
+
+        self._run_func = self.vendor_impl_run
+
+    def vendor_impl_run(self, tensor_mapping):
+        raise NotImplementedError("MultimodalRotaryEmbeddingOp requires a vendor implementation")
+
+
+@register_base_impl
 class StoreKVCacheOp(BasicOp):
     def __init__(self, args_dict, backend, *args, **kwargs):
         super().__init__(args_dict, backend, *args, **kwargs)

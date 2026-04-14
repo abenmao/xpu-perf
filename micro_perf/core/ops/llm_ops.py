@@ -294,6 +294,17 @@ class HeadRMSNormOp(BasicOp):
     def vendor_impl(self):
         self.torch_dtype = get_torch_dtype(self.dtype)
 
+        self._head_rms_norm = self._head_rms_norm_eager
+        if hasattr(torch, "compile"):
+            try:
+                self._head_rms_norm = torch.compile(
+                    self._head_rms_norm_eager,
+                    fullgraph=False,
+                    dynamic=False,
+                )
+            except Exception:
+                self._head_rms_norm = self._head_rms_norm_eager
+
         # in-place
         self.input_tensor_info = {}
         self.output_tensor_info = {}
@@ -323,10 +334,15 @@ class HeadRMSNormOp(BasicOp):
         )
         self.tensor_size = self.input_tensor_size + self.output_tensor_size
 
+        effective_norm_head_num = max(
+            0,
+            min(self.norm_head_num, self.total_head_num - self.norm_head_start)
+        )
         self.read_bytes = \
             calc_tensor_size(self.input_tensor_info["token_data"]) \
             / self.total_head_num \
-            * self.norm_head_num
+            * effective_norm_head_num
+
         self.write_bytes = self.read_bytes
         self.read_bytes += calc_tensor_size(self.input_tensor_info["norm_weight"])
         self.io_bytes = self.read_bytes + self.write_bytes
@@ -342,6 +358,15 @@ class HeadRMSNormOp(BasicOp):
         self._run_func = self.vendor_impl_run
 
 
+    def _head_rms_norm_eager(self, head_data, norm_weight):
+        return torch.nn.functional.rms_norm(
+            head_data,
+            normalized_shape=head_data.shape[-1:],
+            weight=norm_weight,
+            eps=self.eps,
+        )
+
+
     def vendor_impl_run(self, tensor_mapping):
         # get pre-allocated input tensors
         token_data = tensor_mapping["token_data"]
@@ -349,12 +374,8 @@ class HeadRMSNormOp(BasicOp):
 
         # in-place norm on specified heads
         head_data = token_data[:, self.norm_head_start:self.norm_head_end, :]
-        head_data = torch.nn.functional.rms_norm(
-            head_data, 
-            normalized_shape=head_data.shape[-1:],
-            weight=norm_weight,
-            eps=self.eps
-        )
+        head_data = self._head_rms_norm(head_data, norm_weight)
+        #head_data = self._head_rms_norm_eager(head_data, norm_weight)
 
         return token_data
 

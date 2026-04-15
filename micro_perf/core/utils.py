@@ -672,12 +672,20 @@ def rotate(qk, cos, sin):
     return output
 
 
-
 def smooth_per_token_dynamic_quant(
     hidden_states : torch.Tensor, 
     smooth_scale : torch.Tensor, 
     dst_torch_dtype=torch.int8
 ):
+    if hidden_states.numel() == 0:
+        per_token_scale = torch.empty(
+            hidden_states.shape[0], dtype=torch.float32, device=hidden_states.device
+        )
+        quant_tokens = torch.empty(
+            hidden_states.shape, dtype=dst_torch_dtype, device=hidden_states.device
+        )
+        return quant_tokens, per_token_scale
+
     max_dtype_val = 1.0
     if dst_torch_dtype == torch.int8:
         max_dtype_val = 127.0

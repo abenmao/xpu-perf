@@ -16,7 +16,7 @@ from core.utils import OpTensorInfo, calc_tensor_size
 try:
     torch.ops.torch_ipex.sage_attn_paged
 
-    @ProviderRegistry.register_vendor_impl("sage_attn", "ipex")
+    @ProviderRegistry.register_vendor_impl("sage_attention_page", "ipex")
     class SAOp(FlashAttentionOp):
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)

@@ -9,6 +9,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import HeadRMSNormOp as _HeadRMSNormBaseOp
 
 try:
     import torch
@@ -34,7 +35,12 @@ try:
             self.total_head_num = self.args_dict["total_head_num"]
             self.head_dim = self.args_dict["head_dim"]
 
-            self.norm_head_num = self.total_head_num  # TODO: can be different, use self.args_dict["norm_head_num"] later
+            self.norm_head_start = self.args_dict.get("norm_head_start", 0)
+            self.norm_head_num = self.args_dict.get("norm_head_num", self.total_head_num)
+            self.norm_head_end = self.norm_head_start + self.norm_head_num
+
+            if self.norm_head_start != 0 or self.norm_head_num != self.total_head_num:
+                raise NotImplementedError
 
             self.eps = 1e-5
 
@@ -102,3 +108,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": _HeadRMSNormBaseOp}

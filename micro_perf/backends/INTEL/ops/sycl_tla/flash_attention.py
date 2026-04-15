@@ -6,7 +6,7 @@ import subprocess
 
 sys.path.insert(
     0,
-    str(pathlib.Path(__file__).absolute().parents[4])
+    str(pathlib.Path(__file__).absolute().parents[5])
 )
 
 from core.op import ProviderRegistry
@@ -15,7 +15,7 @@ from core.ops.llm_ops import FlashAttentionOp
 try:
     # Resolve sycl-tla path relative to xpu-perf root (xpu-perf/../sycl-tla)
     # flash_attention.py -> ops -> INTEL -> backends -> micro_perf -> xpu-perf
-    _XPU_PERF_ROOT = pathlib.Path(__file__).resolve().parents[4]
+    _XPU_PERF_ROOT = pathlib.Path(__file__).resolve().parents[5]
     SYCL_TLA_DIR = str(_XPU_PERF_ROOT.parent / "sycl-tla")
     SYCL_TLA_BUILD_DIR = os.path.join(
         SYCL_TLA_DIR, "build/examples/06_bmg_flash_attention"

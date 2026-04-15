@@ -12,6 +12,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import MoeSoftmaxTopkOp
 
 try:
     torch.ops.torch_ipex.moe_softmax_topk
@@ -103,3 +104,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": MoeSoftmaxTopkOp}

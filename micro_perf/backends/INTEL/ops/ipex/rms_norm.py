@@ -9,6 +9,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.vector_norm_ops import RMSNormOp
 
 try:
     import torch
@@ -124,3 +125,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": RMSNormOp}

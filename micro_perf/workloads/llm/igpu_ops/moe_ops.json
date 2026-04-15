@@ -75,22 +75,5 @@
             "hidden_size": [2048],
             "num_tokens": [40, 80, 4096]
         }
-    ],
-    "moe_gather": [
-        {
-            "arg_type": "llm",
-            "dtype": "float16",
-            "world_size.rank": [
-                [1, 0]
-            ],
-            "num_shared_experts.dp_size.sp_size": [
-                [0, 1, 1]
-            ],
-            "num_experts.topk.ep_size": [
-                [256, 8, 1]
-            ],
-            "hidden_size": [7168],
-            "num_tokens": [40, 80, 4096]
-        }
     ]
 }

@@ -14,7 +14,7 @@
             ],
             "batch_size": [1],
             "cache_len": [100],
-            "q_seq_len": [4096]
+            "q_len": [4096]
         },
         {
             "arg_type": "llm",
@@ -30,7 +30,7 @@
             ],
             "batch_size": [10, 20],
             "cache_len": [105],
-            "q_seq_len": [4]
+            "q_len": [4]
         },
         {
             "arg_type": "llm",
@@ -46,33 +46,19 @@
             ],
             "batch_size": [10],
             "cache_len": [100],
-            "q_seq_len": [4096]
+            "q_len": [4096]
         }
     ],
-    "store_kv_cache": [
+    "dequant_kv_cache": [
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
-            "mode": "decode",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
-            ],
-            "batch_size": [10, 20],
-            "cache_len": [512],
-            "q_seq_len": [4]
-        },
-        {
-            "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
-            "mode": "prefill",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
-            ],
-            "batch_size": [1],
-            "cache_len": [512],
-            "q_seq_len": [4096]
+            "attn_mode": "decode",
+            "dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "q_head_num.kv_head_num.head_dim": [[64, 8, 128]],
+            "batch_size": [8],
+            "q_len": [1],
+            "cache_len": [1024]
         }
     ],
     "store_paged_kv_cache": [

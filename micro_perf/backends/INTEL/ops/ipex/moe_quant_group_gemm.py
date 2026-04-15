@@ -10,6 +10,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import MoeQuantGroupGemmOp
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -379,3 +380,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": MoeQuantGroupGemmOp}

@@ -10,6 +10,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import StoreKVCacheOp
 from backends.INTEL.ops.utils import generate_decode_data, generate_prefill_data, generate_prefill_session_cache_data
 
 try:
@@ -205,3 +206,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": StoreKVCacheOp}

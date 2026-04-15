@@ -31,22 +31,6 @@
             "batch_size": [10, 20],
             "cache_len": [105],
             "q_len": [4]
-        },
-        {
-            "arg_type": "llm",
-            "dtype": "bfloat16",
-            "mode": "prefill_session_cache",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
-            ],
-            "rope_offset.rope_dim": [
-                [0, 128],
-                [80, 48],
-                [80, 16]
-            ],
-            "batch_size": [10],
-            "cache_len": [100],
-            "q_len": [4096]
         }
     ],
     "dequant_kv_cache": [

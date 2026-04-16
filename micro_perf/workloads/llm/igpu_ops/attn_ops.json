@@ -102,5 +102,19 @@
             "k_seq_len": [8192, 16384, 32768],
             "block_size": [512]
         }
+    ],
+    "sage_attention_v1": [
+        {
+            "arg_type": "llm",
+            "dtype": "float16",
+            "mode": "prefill",
+            "q_head_num": [96, 80, 128, 64, 32, 16],
+            "kv_head_num": [8],
+            "head_dim": [128, 64],
+            "batch_size": [1],
+            "q_seq_len": [4096],
+            "k_seq_len": [8192, 16384, 32768],
+            "block_size": [512]
+        }
     ]
 }

@@ -98,6 +98,7 @@ SUPPORTED_OPS = {
         "store_paged_kv_cache": StoreKVCacheOp,  # INTEL custom, overridden by backend
         "dequant_kv_cache": StoreKVCacheOp,  # INTEL custom, overridden by backend
         "flash_attention": FlashAttentionOp,
+        "sage_attention_v1": FlashAttentionOp,  # INTEL custom, overridden by backend
         "sage_attention_page": FlashAttentionOp,  # INTEL custom, overridden by backend
         "sage_attention_decode_page": FlashAttentionOp,  # INTEL custom, overridden by backend
     }

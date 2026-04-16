@@ -60,13 +60,6 @@ try:
             if need_copy:
                 head_data.copy_(head_data_contiguous)
 
-            # out = torch.empty_like(head_data_contiguous)
-            # # vllm_xpu_kernels exposes rms_norm(out, input, weight, eps), not head_rms_norm.
-            # torch.ops._C.rms_norm(out, head_data_contiguous, norm_weight, self.eps)
-
-            # # Write the normalized heads back to the original token_data view.
-            # head_data.copy_(out)
-
             return token_data
 
 except Exception:

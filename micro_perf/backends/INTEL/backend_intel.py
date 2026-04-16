@@ -94,13 +94,21 @@ class BackendINTEL(Backend):
 
 
     """
-    ccl related
+    xccl related
     """
     def get_dist_module(self):
         return dist
     
+    """
+    For Pytorch 2.9.1 and above, XCCL is added as distributed communication backend for Intel GPUs.
+    XCCL is a distributed backend that enables various distributed training paradigms
+    such as DDP (DistributedDataParallel), FSDP (FullyShardedDataParallel),
+    PP (pipeline parallelism), and TP (tensor parallelism) on XPU devices.
+    XCCL provides all PyTorch communication operations (allreduce, allgather, reducescatter),
+    and can be transparently applied on XPU or explicitly specified as "xccl" backend.
+    """
     def get_dist_backend(self):
-        return "ccl"
+        return "xccl"
     
 
     def core_perf(

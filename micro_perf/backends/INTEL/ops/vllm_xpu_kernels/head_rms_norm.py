@@ -51,15 +51,21 @@ try:
 
             # in-place norm on specified heads
             head_data = token_data[:, self.norm_head_start:self.norm_head_end, :]
+            need_copy = not head_data.is_contiguous()
             head_data_contiguous = head_data.contiguous()
-            out = torch.empty_like(head_data_contiguous)
             norm_weight = norm_weight.to(head_data_contiguous.dtype)
 
             # vllm_xpu_kernels exposes rms_norm(out, input, weight, eps), not head_rms_norm.
-            torch.ops._C.rms_norm(out, head_data_contiguous, norm_weight, self.eps)
+            torch.ops._C.rms_norm(head_data_contiguous, head_data_contiguous, norm_weight, self.eps)
+            if need_copy:
+                head_data.copy_(head_data_contiguous)
 
-            # Write the normalized heads back to the original token_data view.
-            head_data.copy_(out)
+            # out = torch.empty_like(head_data_contiguous)
+            # # vllm_xpu_kernels exposes rms_norm(out, input, weight, eps), not head_rms_norm.
+            # torch.ops._C.rms_norm(out, head_data_contiguous, norm_weight, self.eps)
+
+            # # Write the normalized heads back to the original token_data view.
+            # head_data.copy_(out)
 
             return token_data
 

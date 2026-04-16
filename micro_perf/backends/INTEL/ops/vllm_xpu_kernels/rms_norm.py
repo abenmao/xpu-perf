@@ -9,7 +9,6 @@ sys.path.insert(
 
 from core.op import ProviderRegistry
 from core.ops.vector_norm_ops import RMSNormOp
-from core.utils import calc_tensor_size
 
 
 try:
@@ -29,18 +28,6 @@ try:
                     create_inputs=True,
                     create_outputs=False,
                 )
-                # fused_add_rms_norm is in-place on both input and residual,
-                # and does not allocate/use dst output tensor.
-                src_size = calc_tensor_size(self.input_tensor_info["src"])
-                residual_size = calc_tensor_size(self.input_tensor_info["residual"])
-                weight_size = calc_tensor_size(self.input_tensor_info["weight"])
-
-                self.output_tensor_size = 0
-                self.tensor_size = self.input_tensor_size
-
-                self.read_bytes = src_size + residual_size + weight_size
-                self.write_bytes = src_size + residual_size
-                self.io_bytes = self.read_bytes + self.write_bytes
             else:
                 self._create_tensors_func = partial(
                     self._create_in_out_tensors,

@@ -92,9 +92,8 @@ class BackendINTEL(Backend):
     def empty_cache(self):
         torch.xpu.empty_cache()
 
-
     """
-    xccl related
+    ccl related
     """
     def get_dist_module(self):
         return dist
@@ -106,9 +105,20 @@ class BackendINTEL(Backend):
     PP (pipeline parallelism), and TP (tensor parallelism) on XPU devices.
     XCCL provides all PyTorch communication operations (allreduce, allgather, reducescatter),
     and can be transparently applied on XPU or explicitly specified as "xccl" backend.
+    Add a check here to use XCCL if available, otherwise fallback to CCL.
     """
     def get_dist_backend(self):
-        return "xccl"
+        if dist.distributed_c10d.is_xccl_available():
+            return "xccl"
+        else:
+            try:
+                import oneccl_bindings_for_pytorch
+            except ImportError:
+                raise RuntimeError(
+                    "Neither XCCL backend (PyTorch >= 2.9.1) nor oneccl_bindings_for_pytorch is available. "
+                    "Please upgrade PyTorch or install oneccl_bindings_for_pytorch for CCL backend support."
+                )
+            return "ccl"
     
 
     def core_perf(

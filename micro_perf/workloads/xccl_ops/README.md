@@ -54,3 +54,9 @@ torch.distributed.irecv(tensor, src, tag=0, group=None, async_op=False)
 | output_tensor | [batch_size, dim_size] |
 
 Given a set of devices, we perform pairwise bandwidth tests between every two devices to evaluate the link bandwidth performance of the entire system topology. The test configuration is fixed with a tensor shape of [1024, 2097152], a data type of int8, and a total data volume of 2 GiB.
+
+
+
+
+
+

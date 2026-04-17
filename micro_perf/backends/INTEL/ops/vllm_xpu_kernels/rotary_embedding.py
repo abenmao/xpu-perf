@@ -39,6 +39,12 @@ try:
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["vllm_xpu_kernels"]
 
+        def _get_rotary_slice_bytes(self):
+            dtype_size = torch.tensor([], dtype=self.torch_dtype).element_size()
+            q_bytes = self.num_tokens * self.q_head_num * self.rope_dim * dtype_size
+            k_bytes = self.num_tokens * self.kv_head_num * self.rope_dim * dtype_size
+            return q_bytes, k_bytes
+
         def vendor_impl(self):
             """Override vendor_impl to set up vllm_xpu_kernels rotary embedding.
             
@@ -104,11 +110,13 @@ try:
             self.output_tensor_size = 0
             self.tensor_size = self.input_tensor_size
 
-            self.read_bytes = self.input_tensor_size
-            self.write_bytes = (
-                calc_tensor_size(self.input_tensor_info["q"])
-                + calc_tensor_size(self.input_tensor_info["k"])
-            )
+            q_rotary_bytes, k_rotary_bytes = self._get_rotary_slice_bytes()
+            positions_bytes = calc_tensor_size(self.input_tensor_info["positions"])
+            cache_bytes = calc_tensor_size(self.input_tensor_info["cos_sin_cache"])
+
+            # The kernel only reads and writes the rotary slice of q/k.
+            self.read_bytes = positions_bytes + cache_bytes + q_rotary_bytes + k_rotary_bytes
+            self.write_bytes = q_rotary_bytes + k_rotary_bytes
             self.io_bytes = self.read_bytes + self.write_bytes
 
             self._create_tensors_func = partial(
@@ -124,8 +132,28 @@ try:
             k = tensor_mapping["k"]
             cos_sin_cache = tensor_mapping["cos_sin_cache"]
 
+            if self.rope_offset == 0:
+                torch.ops._C.rotary_embedding(
+                    positions, q, k, self.head_dim, cos_sin_cache, True
+                )
+                return q
+
+            q_view = q.view(self.num_tokens, self.q_head_num, self.head_dim)
+            k_view = k.view(self.num_tokens, self.kv_head_num, self.head_dim)
+
+            dim_start = self.rope_offset
+            dim_end = self.rope_offset + self.rope_dim
+
+            q_rotary_view = q_view[:, :, dim_start:dim_end]
+            k_rotary_view = k_view[:, :, dim_start:dim_end]
+
             torch.ops._C.rotary_embedding(
-                positions, q, k, self.head_dim, cos_sin_cache, True
+                positions,
+                q_rotary_view,
+                k_rotary_view,
+                self.rope_dim,
+                cos_sin_cache,
+                True,
             )
             return q
 

@@ -8,9 +8,12 @@ sys.path.insert(
     0,
     str(pathlib.Path(__file__).absolute().parents[4])
 )
+from core.op import ProviderRegistry
 from core.utils import calc_tensor_size
 from core.ops.llm_ops import HeadRMSNormOp as BaseHeadRMSNormOp
 
+
+@ProviderRegistry.register_vendor_impl("head_rms_norm", "torch")
 class HeadRMSNormTorchOp(BaseHeadRMSNormOp):
 
     def vendor_impl(self):
@@ -57,5 +60,3 @@ class HeadRMSNormTorchOp(BaseHeadRMSNormOp):
         head_data.copy_(normed_data)
         return token_data
 
-
-OP_MAPPING = {"torch": HeadRMSNormTorchOp}

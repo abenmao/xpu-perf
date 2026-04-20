@@ -64,6 +64,64 @@
                 [16, 10240, 1], 
                 [16, 10240, 4]
             ]
+        }, 
+        {
+            "arg_type": "llm", 
+            "attn_mode": "prefill", 
+            "dtype.cache_dtype": [
+                ["bfloat16", "bfloat16"], 
+                ["bfloat16", "int8"]
+            ], 
+            "q_head_num.kv_head_num.head_dim": [
+                [96, 8, 128], 
+                [80, 8, 128], 
+                [28, 4, 128]
+            ], 
+            "batch_size": [1], 
+            "cache_len": [0, 512], 
+            "q_len": [1024, 4096]
+        }, 
+        {
+            "arg_type": "llm", 
+            "attn_mode": "decode", 
+            "dtype.cache_dtype": [
+                ["bfloat16", "bfloat16"], 
+                ["bfloat16", "int8"]
+            ], 
+            "q_head_num.kv_head_num.head_dim": [
+                [96, 8, 128], 
+                [80, 8, 128], 
+                [28, 4, 128]
+            ], 
+            "batch_size": [1, 10, 20], 
+            "cache_len": [512, 1024], 
+            "q_len": [1, 4]
+        }
+    ], 
+    "dequant_kv_cache": [
+        {
+            "arg_type": "llm", 
+            "attn_mode": "prefill", 
+            "dtype": "int8", 
+            "dst_dtype": "bfloat16", 
+            "kv_head_num": [8, 4], 
+            "head_dim": [128], 
+            "batch_size": [1], 
+            "cache_len": [0, 512], 
+            "q_len": [1024, 4096], 
+            "block_size": [0]
+        }, 
+        {
+            "arg_type": "llm", 
+            "attn_mode": "decode", 
+            "dtype": "int8", 
+            "dst_dtype": "bfloat16", 
+            "kv_head_num": [8, 4], 
+            "head_dim": [128], 
+            "batch_size": [1, 8, 10, 20], 
+            "cache_len": [512, 1024], 
+            "q_len": [1], 
+            "block_size": [0]
         }
     ]
 }

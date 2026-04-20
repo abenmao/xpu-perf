@@ -53,25 +53,20 @@ try:
             bs = self.batch_size
 
             k_head_start = self.q_head_num
-            k_head_end = self.q_head_num + self.kv_head_num
-            v_head_start = self.q_head_num + self.kv_head_num
-            v_head_end = self.q_head_num + self.kv_head_num * 2
-
-            # Extract K,V: [num_tokens, kv_head, head_dim] and make contiguous
-            key = packed_qkv[:, k_head_start:k_head_end, :].contiguous()
-            value = packed_qkv[:, v_head_start:v_head_end, :].contiguous()
 
             if self.use_quant:
                 k_scale = tensor_mapping["k_scale"]
                 v_scale = tensor_mapping["v_scale"]
                 _sycl_ext.store_kv_cache_int8(
-                    key, value, k_cache, v_cache,
+                    packed_qkv, k_cache, v_cache,
                     k_scale, v_scale,
+                    k_head_start, self.kv_head_num,
                     bs, q_len, cache_len
                 )
             else:
                 _sycl_ext.store_kv_cache_bf16(
-                    key, value, k_cache, v_cache,
+                    packed_qkv, k_cache, v_cache,
+                    k_head_start, self.kv_head_num,
                     bs, q_len, cache_len
                 )
 

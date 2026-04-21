@@ -164,4 +164,4 @@ class FlashAttentionXpuOp(FlashAttentionOp):
 
 
 OP_MAPPING["xpu_flash_attention"] = FlashAttentionXpuOp
-OP_MAPPING["torch"] = FlashAttentionOp
+OP_MAPPING["torch"] = FlashAttentionXpuOp

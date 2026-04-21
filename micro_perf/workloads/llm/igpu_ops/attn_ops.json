@@ -43,6 +43,30 @@
             "batch_size": [8],
             "q_len": [1],
             "cache_len": [1024]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "kv_head_num": [8, 4],
+            "head_dim": [128],
+            "batch_size": [1],
+            "cache_len": [0, 512],
+            "q_len": [1024, 4096],
+            "block_size": [0]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "decode",
+            "dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "kv_head_num": [8, 4],
+            "head_dim": [128],
+            "batch_size": [1, 8, 10, 20],
+            "cache_len": [512, 1024],
+            "q_len": [1],
+            "block_size": [0]
         }
     ],
     "store_paged_kv_cache": [

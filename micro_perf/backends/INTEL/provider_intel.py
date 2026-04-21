@@ -32,3 +32,18 @@ try:
     }
 except:
     pass
+
+
+# https://github.com/oneapi-src/oneDNN  (locally-built under <xpu-perf>/../oneDNN/build)
+try:
+    import os as _os
+    import pathlib as _pathlib
+    _ONEDNN_DIR = str(_pathlib.Path(__file__).resolve().parents[3].parent / "oneDNN")
+    _ONEDNN_BENCHDNN = _os.path.join(_ONEDNN_DIR, "build", "tests", "benchdnn", "benchdnn")
+    _ONEDNN_LIB = _os.path.join(_ONEDNN_DIR, "build", "src")
+    if _os.path.isfile(_ONEDNN_BENCHDNN) and _os.path.isdir(_ONEDNN_LIB):
+        INTEL_PROVIDER["onednn"] = {
+            "onednn": f"local-build ({_ONEDNN_DIR}/build)",
+        }
+except:
+    pass

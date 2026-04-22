@@ -51,16 +51,28 @@ try:
             bs = self.batch_size
             kv_len = self.kv_lens[0]
 
-            # Cast scale to bf16 (matching torch's .to(bfloat16) truncation)
-            k_scale_bf16 = k_scale.to(torch.bfloat16)
-            v_scale_bf16 = v_scale.to(torch.bfloat16)
+            if self.dtype in ("float8", "float8_e4m3"):
+                # FP8 dequant: scale as bf16 (matching torch's .to(bfloat16) truncation)
+                k_scale_bf16 = k_scale.to(torch.bfloat16)
+                v_scale_bf16 = v_scale.to(torch.bfloat16)
 
-            _sycl_ext.dequant_kv_cache(
-                k_cache, v_cache,
-                dequant_k_cache, dequant_v_cache,
-                k_scale_bf16, v_scale_bf16,
-                bs, kv_len
-            )
+                _sycl_ext.dequant_kv_cache_fp8(
+                    k_cache, v_cache,
+                    dequant_k_cache, dequant_v_cache,
+                    k_scale_bf16, v_scale_bf16,
+                    bs, kv_len
+                )
+            else:
+                # INT8 dequant
+                k_scale_bf16 = k_scale.to(torch.bfloat16)
+                v_scale_bf16 = v_scale.to(torch.bfloat16)
+
+                _sycl_ext.dequant_kv_cache(
+                    k_cache, v_cache,
+                    dequant_k_cache, dequant_v_cache,
+                    k_scale_bf16, v_scale_bf16,
+                    bs, kv_len
+                )
 
             return dequant_k_cache, dequant_v_cache
 

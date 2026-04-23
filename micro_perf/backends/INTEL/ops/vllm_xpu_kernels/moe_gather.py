@@ -9,17 +9,14 @@ sys.path.insert(
 )
 
 from core.op import ProviderRegistry
-from core.ops.llm_ops import MoeGatherOp as MoeGatherBaseOp
+from core.ops.llm_ops import MoeGatherOp
 from core.utils import OpTensorInfo, calc_tensor_size, create_from_list
 
 
 try:
     import vllm_xpu_kernels._moe_C
-
-    torch.ops._moe_C.moe_gather
-
     @ProviderRegistry.register_vendor_impl("moe_gather", "vllm_xpu_kernels")
-    class VLLMXPUKernelsMoeGatherOp(MoeGatherBaseOp):
+    class VLLMXPUKernelsMoeGatherOp(MoeGatherOp):
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["vllm_xpu_kernels"]

@@ -1,11 +1,16 @@
 #!/bin/bash
-# Build SYCL KV cache kernels as PyTorch extension
+# Build SYCL kernels used by xpu-perf sycl_ext ops.
 # Usage: source /opt/intel/oneapi/setvars.sh && bash build.sh
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+if ! command -v icpx >/dev/null 2>&1; then
+    echo "ERROR: icpx not found. Please source oneAPI setvars first."
+    exit 1
+fi
 
 # Get torch include/lib paths
 TORCH_INCLUDES=$(python3 -c "
@@ -49,3 +54,31 @@ icpx -fsycl -shared -fPIC -O2 -std=c++17 \
 
 echo "Built: $SCRIPT_DIR/dequant_kv_cache_sycl.so"
 ls -la dequant_kv_cache_sycl.so
+
+echo ""
+echo "Building reduce_min SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=reduce_min_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    reduce_min_kernel.cpp \
+    -o reduce_min_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10
+
+echo "Built: $SCRIPT_DIR/reduce_min_sycl.so"
+ls -la reduce_min_sycl.so
+
+echo ""
+echo "Building reduce_max SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=reduce_max_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    reduce_max_kernel.cpp \
+    -o reduce_max_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10
+
+echo "Built: $SCRIPT_DIR/reduce_max_sycl.so"
+ls -la reduce_max_sycl.so

@@ -49,3 +49,15 @@ icpx -fsycl -shared -fPIC -O2 -std=c++17 \
 
 echo "Built: $SCRIPT_DIR/dequant_kv_cache_sycl.so"
 ls -la dequant_kv_cache_sycl.so
+
+echo ""
+echo "=========================================="
+echo "Building FlashMLA SYCL extension..."
+echo "=========================================="
+FLASHMLA_DIR="$SCRIPT_DIR/flashmla"
+cd "$FLASHMLA_DIR"
+cmake -B build . -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j8
+cp build/flash_attn_xpu.abi3.so "$FLASHMLA_DIR/"
+echo "Built: $FLASHMLA_DIR/flash_attn_xpu.abi3.so"
+ls -la "$FLASHMLA_DIR/flash_attn_xpu.abi3.so"

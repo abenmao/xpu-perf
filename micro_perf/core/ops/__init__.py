@@ -101,6 +101,12 @@ SUPPORTED_OPS = {
         "sage_attention_v1": FlashAttentionOp,  # INTEL custom, overridden by backend
         "sage_attention_page": FlashAttentionOp,  # INTEL custom, overridden by backend
         "sage_attention_decode_page": FlashAttentionOp,  # INTEL custom, overridden by backend
+
+        # llm: MLA ATTN
+        "mla_dense_decode": MLADenseDecodeOp,
+        "mla_dense_prefill": MLADensePrefillOp,
+        "mla_sparse_decode": MLASparseDecodeOp,
+        "mla_sparse_prefill": MLASparsePrefillOp,
     }
 }
 

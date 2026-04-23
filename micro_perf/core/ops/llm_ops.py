@@ -1438,6 +1438,685 @@ class FlashAttentionOp(BasicOp):
 
 """
 ******************************************
+MLA (Multi-head Latent Attention) 算子
+******************************************
+"""
+
+class MLABaseMixin:
+    """MLA 算子共享的 summary 扩展，增加 MFU(%) 和 MBU(%) 指标"""
+
+    def summary(self, latency_us, kernel_mapping={}):
+        target_dict = super().summary(latency_us, kernel_mapping)
+        if latency_us > 0 and not self.is_concurrent:
+            peak_tflops = getattr(self, '_peak_tflops', 0)
+            peak_mem_bw_gbps = getattr(self, '_peak_mem_bw_gbps', 0)
+
+            calc_flops_power = self.calc_flops / latency_us / 1e6
+            mem_bw = self.io_bytes / latency_us / 1e3
+
+            target_dict["MFU(%)"] = round(
+                calc_flops_power / peak_tflops * 100, 3
+            ) if peak_tflops > 0 else 0.0
+            target_dict["MBU(%)"] = round(
+                mem_bw / peak_mem_bw_gbps * 100, 3
+            ) if peak_mem_bw_gbps > 0 else 0.0
+        return target_dict
+
+
+@register_base_impl
+class MLADenseDecodeOp(MLABaseMixin, BasicOp):
+    """MLA Dense Decode: paged KV cache, GQA, causal optional.
+
+    KV cache 采用 fused 存储 (K 和 V 共享同一 tensor, V = KV[:, :, :, :d_v])，
+    与标准 FlashAttention 的分离 K/V cache 不同。
+    """
+
+    def __init__(self, args_dict, backend, *args, **kwargs):
+        super().__init__(args_dict, backend, *args, **kwargs)
+
+    def prepare(self):
+        self.arg_type = self.args_dict["arg_type"]
+        if self.arg_type not in ["llm"]:
+            raise ValueError(
+                f"MLADenseDecodeOp only supports llm arg_type, got {self.arg_type}"
+            )
+
+        self.attn_mode = self.args_dict.get("attn_mode", "decode")
+        if self.attn_mode != "decode":
+            raise ValueError("MLADenseDecodeOp only supports decode mode")
+        get_attn_info(self.arg_type, self.attn_mode, self.args_dict, self)
+
+        self.q_head_num = self.args_dict["q_head_num"]
+        self.kv_head_num = self.args_dict.get("kv_head_num", 1)
+        self.d_qk = self.args_dict.get("d_qk", 576)
+        self.d_v = self.args_dict.get("d_v", 512)
+        self.page_size = self.args_dict.get("page_size", 64)
+        self.is_causal = self.args_dict.get("is_causal", False)
+        self.softmax_scale = self.d_qk ** (-0.5)
+
+        self.dtype = self.args_dict.get("dtype", "bfloat16")
+
+        # hardware peak for MFU/MBU
+        self._peak_tflops = self.args_dict.get("peak_tflops", 0)
+        self._peak_mem_bw_gbps = self.args_dict.get("peak_mem_bw_gbps", 0)
+
+        self.flops_calc()
+        self.vendor_parser()
+        self.vendor_impl()
+
+    def flops_calc(self):
+        self.calc_flops = 0
+        for batch_idx in range(self.batch_size):
+            cache_len = self.cache_lens[batch_idx]
+            q_len = self.q_lens[batch_idx]
+            kv_len = self.kv_lens[batch_idx]
+
+            if self.is_causal:
+                valid_parts = (cache_len + 1 + kv_len) * q_len / 2
+            else:
+                valid_parts = q_len * kv_len
+
+            # QK^T: 2 * h_q * valid_parts * d_qk
+            # PV:   2 * h_q * valid_parts * d_v
+            self.calc_flops += self.q_head_num * valid_parts * (2 * self.d_qk + 2 * self.d_v)
+
+    def vendor_parser(self):
+        if self.dtype not in ["bfloat16", "float16"]:
+            raise ValueError(
+                f"MLADenseDecodeOp only supports bfloat16/float16, got {self.dtype}"
+            )
+
+    def vendor_impl(self):
+        self.torch_dtype = get_torch_dtype(self.dtype)
+
+        self.input_tensor_info = {}
+        self.output_tensor_info = {}
+
+        # Q: [batch, s_q, h_q, d_qk]
+        self.input_tensor_info["q"] = OpTensorInfo(
+            shape=[self.batch_size, self.max_q_len, self.q_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # Fused KV cache (paged): [num_blocks, page_size, h_kv, d_qk]
+        total_pages = 0
+        for batch_idx in range(self.batch_size):
+            kv_len = self.kv_lens[batch_idx]
+            total_pages += (kv_len + self.page_size - 1) // self.page_size
+        max_pages_per_seq = (self.max_kv_len + self.page_size - 1) // self.page_size
+        total_cache_pages = self.batch_size * max_pages_per_seq
+
+        self.input_tensor_info["kv_cache"] = OpTensorInfo(
+            shape=[total_cache_pages, self.page_size, self.kv_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+            creator=torch.empty,
+        )
+
+        # block_table: [batch, max_pages_per_seq]
+        self.input_tensor_info["block_table"] = OpTensorInfo(
+            shape=[self.batch_size, max_pages_per_seq],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: torch.arange(
+                size[0] * size[1], dtype=dtype, device=device
+            ).view(size[0], size[1]),
+        )
+
+        # cache_seqlens: [batch]
+        self.input_tensor_info["cache_seqlens"] = OpTensorInfo(
+            shape=[self.batch_size],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: torch.tensor(
+                self.kv_lens, dtype=dtype, device=device
+            ),
+        )
+
+        # Output: [batch, s_q, h_q, d_v]
+        self.output_tensor_info["out"] = OpTensorInfo(
+            shape=[self.batch_size, self.max_q_len, self.q_head_num, self.d_v],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # IO calculation
+        self.input_tensor_size = sum(
+            calc_tensor_size(info) for info in self.input_tensor_info.values()
+        )
+        self.output_tensor_size = sum(
+            calc_tensor_size(info) for info in self.output_tensor_info.values()
+        )
+        self.tensor_size = self.input_tensor_size + self.output_tensor_size
+
+        # Read: Q + actually-accessed portion of KV cache + metadata
+        q_bytes = calc_tensor_size(self.input_tensor_info["q"])
+        full_cache_bytes = calc_tensor_size(self.input_tensor_info["kv_cache"])
+        accessed_cache_bytes = full_cache_bytes / total_cache_pages * total_pages
+
+        self.read_bytes = q_bytes + accessed_cache_bytes
+        self.write_bytes = self.output_tensor_size
+        self.io_bytes = self.read_bytes + self.write_bytes
+
+        self._create_tensors_func = partial(
+            self._create_in_out_tensors,
+            create_inputs=True,
+            create_outputs=False,
+        )
+        self._run_func = self.vendor_impl_run
+
+    def vendor_impl_run(self, tensor_mapping):
+        raise NotImplementedError
+
+
+@register_base_impl
+class MLADensePrefillOp(MLABaseMixin, BasicOp):
+    """MLA Dense Prefill: dedicated MLA dense prefill kernel.
+
+    使用 flash_mla_dense_prefill_fwd 接口，KV 融合为单个 contiguous tensor
+    (KV: [total_kv, h_kv, d_qk])，通过 cu_seqlens_q/cu_seqlens_k 描述
+    变长序列边界。
+    """
+
+    def __init__(self, args_dict, backend, *args, **kwargs):
+        super().__init__(args_dict, backend, *args, **kwargs)
+
+    def prepare(self):
+        self.arg_type = self.args_dict["arg_type"]
+        if self.arg_type not in ["llm"]:
+            raise ValueError(
+                f"MLADensePrefillOp only supports llm arg_type, got {self.arg_type}"
+            )
+
+        self.attn_mode = self.args_dict.get("attn_mode", "prefill")
+        if self.attn_mode != "prefill":
+            raise ValueError("MLADensePrefillOp only supports prefill mode")
+        get_attn_info(self.arg_type, self.attn_mode, self.args_dict, self)
+
+        self.q_head_num = self.args_dict["q_head_num"]
+        self.kv_head_num = self.args_dict.get("kv_head_num", 1)
+        self.d_qk = self.args_dict.get("d_qk", 576)
+        self.d_v = self.args_dict.get("d_v", 512)
+        self.is_causal = self.args_dict.get("is_causal", True)
+        self.softmax_scale = self.d_qk ** (-0.5)
+
+        self.dtype = self.args_dict.get("dtype", "bfloat16")
+
+        self._peak_tflops = self.args_dict.get("peak_tflops", 0)
+        self._peak_mem_bw_gbps = self.args_dict.get("peak_mem_bw_gbps", 0)
+
+        # Compute total_kv (contiguous KV length) and cumulative KV seq lens
+        self.total_kv = sum(self.kv_lens)
+        self.accum_kv_lens = [0]
+        for kv_len in self.kv_lens:
+            self.accum_kv_lens.append(self.accum_kv_lens[-1] + kv_len)
+
+        self.flops_calc()
+        self.vendor_parser()
+        self.vendor_impl()
+
+    def flops_calc(self):
+        self.calc_flops = 0
+        for batch_idx in range(self.batch_size):
+            q_len = self.q_lens[batch_idx]
+            cache_len = self.cache_lens[batch_idx]
+            kv_len = self.kv_lens[batch_idx]
+
+            if self.is_causal:
+                valid_parts = (cache_len + 1 + kv_len) * q_len / 2
+            else:
+                valid_parts = q_len * kv_len
+
+            self.calc_flops += self.q_head_num * valid_parts * (2 * self.d_qk + 2 * self.d_v)
+
+    def vendor_parser(self):
+        if self.dtype not in ["bfloat16"]:
+            raise ValueError(
+                f"MLADensePrefillOp only supports bfloat16, got {self.dtype}"
+            )
+
+    def vendor_impl(self):
+        self.torch_dtype = get_torch_dtype(self.dtype)
+
+        self.input_tensor_info = {}
+        self.output_tensor_info = {}
+
+        # Q: [num_tokens, h_q, d_qk]
+        self.input_tensor_info["q"] = OpTensorInfo(
+            shape=[self.num_tokens, self.q_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # KV: [total_kv, h_kv, d_qk] — fused contiguous KV
+        self.input_tensor_info["kv"] = OpTensorInfo(
+            shape=[self.total_kv, self.kv_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # cu_seqlens_q: [batch + 1]
+        self.input_tensor_info["cu_seqlens_q"] = OpTensorInfo(
+            shape=[self.batch_size + 1],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: torch.tensor(
+                self.accum_q_lens, dtype=dtype, device=device
+            ),
+        )
+
+        # cu_seqlens_k: [batch + 1]
+        self.input_tensor_info["cu_seqlens_k"] = OpTensorInfo(
+            shape=[self.batch_size + 1],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: torch.tensor(
+                self.accum_kv_lens, dtype=dtype, device=device
+            ),
+        )
+
+        # Output: [num_tokens, h_q, d_v]
+        self.output_tensor_info["out"] = OpTensorInfo(
+            shape=[self.num_tokens, self.q_head_num, self.d_v],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # IO calculation
+        self.input_tensor_size = sum(
+            calc_tensor_size(info) for info in self.input_tensor_info.values()
+        )
+        self.output_tensor_size = sum(
+            calc_tensor_size(info) for info in self.output_tensor_info.values()
+        )
+        self.tensor_size = self.input_tensor_size + self.output_tensor_size
+
+        q_bytes = calc_tensor_size(self.input_tensor_info["q"])
+        kv_bytes = calc_tensor_size(self.input_tensor_info["kv"])
+
+        self.read_bytes = q_bytes + kv_bytes
+        self.write_bytes = self.output_tensor_size
+        self.io_bytes = self.read_bytes + self.write_bytes
+
+        self._create_tensors_func = partial(
+            self._create_in_out_tensors,
+            create_inputs=True,
+            create_outputs=False,
+        )
+        self._run_func = self.vendor_impl_run
+
+    def vendor_impl_run(self, tensor_mapping):
+        raise NotImplementedError
+
+
+@register_base_impl
+class MLASparseDecodeOp(MLABaseMixin, BasicOp):
+    """MLA Sparse Decode: top-K indexed KV attention with FP8 & dual-scope support.
+
+    Sparse decode 通过 indices 指定每个 query 关注的 top-K 个 KV token，
+    不读取全部 KV cache。支持 FP8 量化和 dual-scope（两组 KV cache 结果合并）。
+    """
+
+    def __init__(self, args_dict, backend, *args, **kwargs):
+        super().__init__(args_dict, backend, *args, **kwargs)
+
+    def prepare(self):
+        self.arg_type = self.args_dict["arg_type"]
+        if self.arg_type not in ["llm"]:
+            raise ValueError(
+                f"MLASparseDecodeOp only supports llm arg_type, got {self.arg_type}"
+            )
+
+        self.attn_mode = self.args_dict.get("attn_mode", "decode")
+        if self.attn_mode != "decode":
+            raise ValueError("MLASparseDecodeOp only supports decode mode")
+        get_attn_info(self.arg_type, self.attn_mode, self.args_dict, self)
+
+        self.q_head_num = self.args_dict["q_head_num"]
+        self.kv_head_num = self.args_dict.get("kv_head_num", 1)
+        self.d_qk = self.args_dict.get("d_qk", 576)
+        self.d_v = self.args_dict.get("d_v", 512)
+        self.topk = self.args_dict["topk"]
+        self.block_size = self.args_dict.get("block_size", 64)
+        self.softmax_scale = self.args_dict.get(
+            "softmax_scale", self.d_qk ** (-0.5)
+        )
+
+        self.dtype = self.args_dict.get("dtype", "bfloat16")
+        self.cache_dtype = self.args_dict.get("cache_dtype", "bfloat16")
+        self.is_fp8 = self.cache_dtype in ["fp8", "float8", "float8_e4m3"]
+
+        # Optional features
+        self.enable_attn_sink = self.args_dict.get("enable_attn_sink", False)
+        self.enable_topk_length = self.args_dict.get("enable_topk_length", False)
+
+        # Dual-scope
+        self.enable_dual_scope = self.args_dict.get("enable_dual_scope", False)
+        self.extra_topk = self.args_dict.get("extra_topk", 0)
+        self.extra_s_kv = self.args_dict.get("extra_s_kv", 0)
+        self.extra_block_size = self.args_dict.get(
+            "extra_block_size", self.block_size
+        )
+
+        self._peak_tflops = self.args_dict.get("peak_tflops", 0)
+        self._peak_mem_bw_gbps = self.args_dict.get("peak_mem_bw_gbps", 0)
+
+        self.flops_calc()
+        self.vendor_parser()
+        self.vendor_impl()
+
+    def flops_calc(self):
+        # total attended tokens
+        total_attended = self.batch_size * self.max_q_len * self.topk
+        if self.enable_dual_scope and self.extra_topk > 0:
+            total_attended += self.batch_size * self.max_q_len * self.extra_topk
+        self.calc_flops = self.q_head_num * total_attended * (2 * self.d_qk + 2 * self.d_v)
+
+    def vendor_parser(self):
+        if self.dtype not in ["bfloat16"]:
+            raise ValueError(
+                f"MLASparseDecodeOp only supports bfloat16 input, got {self.dtype}"
+            )
+
+    def vendor_impl(self):
+        self.torch_dtype = get_torch_dtype(self.dtype)
+
+        self.input_tensor_info = {}
+        self.output_tensor_info = {}
+
+        # Q: [batch, s_q, h_q, d_qk]
+        self.input_tensor_info["q"] = OpTensorInfo(
+            shape=[self.batch_size, self.max_q_len, self.q_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # KV cache (paged, flat indexing): [num_blocks * block_size, h_kv, d_qk]
+        max_kv_len = self.max_kv_len if self.max_kv_len > 0 else self.topk * 2
+        total_kv_tokens = self.batch_size * max_kv_len
+        # FP8: use float8_e4m3fn with padded layout (V32: 656, MODEL1: 584)
+        if self.is_fp8:
+            cache_torch_dtype = torch.float8_e4m3fn
+            # V32_FP8Sparse: 512 NoPE + 16 scale + 128 RoPE = 656
+            # MODEL1_FP8Sparse: 448 NoPE + 128 RoPE + 8 scale = 584
+            self._fp8_kv_dim = 656 if self.d_qk == 576 else 584
+        else:
+            cache_torch_dtype = self.torch_dtype
+            self._fp8_kv_dim = self.d_qk
+
+        # Paged KV: [total_blocks, block_size, h_kv, kv_dim]
+        total_blocks = (total_kv_tokens + self.block_size - 1) // self.block_size
+        self._total_blocks = total_blocks
+        kv_last_dim = self._fp8_kv_dim if self.is_fp8 else self.d_qk
+        self.input_tensor_info["kv_cache"] = OpTensorInfo(
+            shape=[total_blocks, self.block_size, self.kv_head_num, kv_last_dim],
+            dtype=cache_torch_dtype,
+            device=self.backend.get_torch_device_name(),
+            creator=torch.empty,
+        )
+
+        # block_table: [batch, max_blocks_per_seq]
+        max_blocks_per_seq = (max_kv_len + self.block_size - 1) // self.block_size
+        self.input_tensor_info["block_table"] = OpTensorInfo(
+            shape=[self.batch_size, max_blocks_per_seq],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: torch.arange(
+                size[0] * size[1], dtype=dtype, device=device
+            ).view(size[0], size[1]),
+        )
+
+        # cache_seqlens: [batch]
+        self.input_tensor_info["cache_seqlens"] = OpTensorInfo(
+            shape=[self.batch_size],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+            creator=lambda size, dtype, device: torch.tensor(
+                self.kv_lens, dtype=dtype, device=device
+            ),
+        )
+
+        # indices: [batch, s_q, topk]
+        self.input_tensor_info["indices"] = OpTensorInfo(
+            shape=[self.batch_size, self.max_q_len, self.topk],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # Optional: topk_length [batch]
+        if self.enable_topk_length:
+            self.input_tensor_info["topk_length"] = OpTensorInfo(
+                shape=[self.batch_size],
+                dtype=torch.int32,
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.full(
+                    size, self.topk, dtype=dtype, device=device
+                ),
+            )
+
+        # Optional: attn_sink [h_q]
+        if self.enable_attn_sink:
+            self.input_tensor_info["attn_sink"] = OpTensorInfo(
+                shape=[self.q_head_num],
+                dtype=torch.float32,
+                device=self.backend.get_torch_device_name(),
+            )
+
+        # Dual-scope: extra KV cache and indices
+        if self.enable_dual_scope and self.extra_topk > 0:
+            extra_kv_len = self.extra_s_kv if self.extra_s_kv > 0 else self.extra_topk * 2
+            extra_total_blocks = (
+                self.batch_size * extra_kv_len + self.extra_block_size - 1
+            ) // self.extra_block_size
+            self._extra_total_blocks = extra_total_blocks
+
+            self.input_tensor_info["extra_kv_cache"] = OpTensorInfo(
+                shape=[extra_total_blocks, self.extra_block_size, self.kv_head_num, kv_last_dim],
+                dtype=cache_torch_dtype,
+                device=self.backend.get_torch_device_name(),
+                creator=torch.empty,
+            )
+            self.input_tensor_info["extra_indices"] = OpTensorInfo(
+                shape=[self.batch_size, self.max_q_len, self.extra_topk],
+                dtype=torch.int32,
+                device=self.backend.get_torch_device_name(),
+            )
+            if self.enable_topk_length:
+                self.input_tensor_info["extra_topk_length"] = OpTensorInfo(
+                    shape=[self.batch_size],
+                    dtype=torch.int32,
+                    device=self.backend.get_torch_device_name(),
+                    creator=lambda size, dtype, device: torch.full(
+                        size, self.extra_topk, dtype=dtype, device=device
+                    ),
+                )
+
+        # Output: [batch, s_q, h_q, d_v]
+        self.output_tensor_info["out"] = OpTensorInfo(
+            shape=[self.batch_size, self.max_q_len, self.q_head_num, self.d_v],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # IO calculation
+        self.input_tensor_size = sum(
+            calc_tensor_size(info) for info in self.input_tensor_info.values()
+        )
+        self.output_tensor_size = sum(
+            calc_tensor_size(info) for info in self.output_tensor_info.values()
+        )
+        self.tensor_size = self.input_tensor_size + self.output_tensor_size
+
+        # KV token size for IO accounting
+        if self.is_fp8:
+            kv_token_bytes = self._fp8_kv_dim
+        else:
+            kv_token_bytes = self.d_qk * get_torch_dtype_size(self.torch_dtype)
+
+        # Read: Q + KV tokens retrieved + indices + metadata
+        q_bytes = calc_tensor_size(self.input_tensor_info["q"])
+        num_kv_retrieved = self.batch_size * self.max_q_len * self.topk
+        indices_bytes = calc_tensor_size(self.input_tensor_info["indices"])
+        kv_read = num_kv_retrieved * kv_token_bytes
+        if self.enable_dual_scope and self.extra_topk > 0:
+            extra_retrieved = self.batch_size * self.max_q_len * self.extra_topk
+            kv_read += extra_retrieved * kv_token_bytes
+            indices_bytes += calc_tensor_size(self.input_tensor_info["extra_indices"])
+
+        self.read_bytes = q_bytes + kv_read + indices_bytes
+        self.write_bytes = self.output_tensor_size
+        self.io_bytes = self.read_bytes + self.write_bytes
+
+        self._create_tensors_func = partial(
+            self._create_in_out_tensors,
+            create_inputs=True,
+            create_outputs=False,
+        )
+        self._run_func = self.vendor_impl_run
+
+    def vendor_impl_run(self, tensor_mapping):
+        raise NotImplementedError
+
+
+@register_base_impl
+class MLASparsePrefillOp(MLABaseMixin, BasicOp):
+    """MLA Sparse Prefill: top-K indexed sparse attention for prefill phase.
+
+    输入为 contiguous KV tensor (非 paged)，通过 indices 指定每个 query
+    关注的 top-K 个 KV token。
+    """
+
+    def __init__(self, args_dict, backend, *args, **kwargs):
+        super().__init__(args_dict, backend, *args, **kwargs)
+
+    def prepare(self):
+        self.arg_type = self.args_dict["arg_type"]
+        if self.arg_type not in ["llm"]:
+            raise ValueError(
+                f"MLASparsePrefillOp only supports llm arg_type, got {self.arg_type}"
+            )
+
+        self.q_head_num = self.args_dict["q_head_num"]
+        self.kv_head_num = self.args_dict.get("kv_head_num", 1)
+        self.d_qk = self.args_dict.get("d_qk", 576)
+        self.d_v = self.args_dict.get("d_v", 512)
+        self.s_q = self.args_dict["s_q"]
+        self.s_kv = self.args_dict["s_kv"]
+        self.topk = self.args_dict["topk"]
+        self.softmax_scale = self.args_dict.get(
+            "softmax_scale", self.d_qk ** (-0.5)
+        )
+
+        self.dtype = self.args_dict.get("dtype", "bfloat16")
+
+        # Optional features
+        self.enable_attn_sink = self.args_dict.get("enable_attn_sink", False)
+        self.enable_topk_length = self.args_dict.get("enable_topk_length", False)
+
+        self._peak_tflops = self.args_dict.get("peak_tflops", 0)
+        self._peak_mem_bw_gbps = self.args_dict.get("peak_mem_bw_gbps", 0)
+
+        self.flops_calc()
+        self.vendor_parser()
+        self.vendor_impl()
+
+    def flops_calc(self):
+        # Total attended = s_q * topk (conservative, ignoring invalid indices)
+        total_topk = self.s_q * self.topk
+        self.calc_flops = self.q_head_num * total_topk * (2 * self.d_qk + 2 * self.d_v)
+
+    def vendor_parser(self):
+        if self.dtype not in ["bfloat16"]:
+            raise ValueError(
+                f"MLASparsePrefillOp only supports bfloat16, got {self.dtype}"
+            )
+
+    def vendor_impl(self):
+        self.torch_dtype = get_torch_dtype(self.dtype)
+
+        self.input_tensor_info = {}
+        self.output_tensor_info = {}
+
+        # Q: [s_q, h_q, d_qk]
+        self.input_tensor_info["q"] = OpTensorInfo(
+            shape=[self.s_q, self.q_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # KV: [s_kv, h_kv, d_qk] (contiguous, BF16)
+        self.input_tensor_info["kv"] = OpTensorInfo(
+            shape=[self.s_kv, self.kv_head_num, self.d_qk],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # indices: [s_q, h_kv, topk]
+        self.input_tensor_info["indices"] = OpTensorInfo(
+            shape=[self.s_q, self.kv_head_num, self.topk],
+            dtype=torch.int32,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # Optional: topk_length [s_q]
+        if self.enable_topk_length:
+            self.input_tensor_info["topk_length"] = OpTensorInfo(
+                shape=[self.s_q],
+                dtype=torch.int32,
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.full(
+                    size, self.topk, dtype=dtype, device=device
+                ),
+            )
+
+        # Optional: attn_sink [h_q]
+        if self.enable_attn_sink:
+            self.input_tensor_info["attn_sink"] = OpTensorInfo(
+                shape=[self.q_head_num],
+                dtype=torch.float32,
+                device=self.backend.get_torch_device_name(),
+            )
+
+        # Output: [s_q, h_q, d_v]
+        self.output_tensor_info["out"] = OpTensorInfo(
+            shape=[self.s_q, self.q_head_num, self.d_v],
+            dtype=self.torch_dtype,
+            device=self.backend.get_torch_device_name(),
+        )
+
+        # IO calculation
+        self.input_tensor_size = sum(
+            calc_tensor_size(info) for info in self.input_tensor_info.values()
+        )
+        self.output_tensor_size = sum(
+            calc_tensor_size(info) for info in self.output_tensor_info.values()
+        )
+        self.tensor_size = self.input_tensor_size + self.output_tensor_size
+
+        dtype_size = get_torch_dtype_size(self.torch_dtype)
+        q_bytes = self.s_q * self.q_head_num * self.d_qk * dtype_size
+        # KV: conservatively estimate reading all unique tokens
+        kv_bytes = self.s_kv * self.kv_head_num * self.d_qk * dtype_size
+        indices_bytes = self.s_q * self.kv_head_num * self.topk * 4  # int32
+
+        self.read_bytes = q_bytes + kv_bytes + indices_bytes
+        self.write_bytes = self.s_q * self.q_head_num * self.d_v * dtype_size
+        self.io_bytes = self.read_bytes + self.write_bytes
+
+        self._create_tensors_func = partial(
+            self._create_in_out_tensors,
+            create_inputs=True,
+            create_outputs=False,
+        )
+        self._run_func = self.vendor_impl_run
+
+    def vendor_impl_run(self, tensor_mapping):
+        raise NotImplementedError
+
+
+"""
+******************************************
 gemm & group_gemm & moe_ops
 ******************************************
 """

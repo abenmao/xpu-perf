@@ -14,7 +14,7 @@ def _rope_inplace(qk, cos_h, sin_h):
     out2 = x2 * cos_h + x1 * sin_h
     qk.copy_(torch.cat([out1, out2], dim=-1))
 
-@ProviderRegistry.register_vendor_impl("rotary_embedding", "torch")
+@ProviderRegistry.register_vendor_impl("rotary_embedding", "torch_compiled")
 class RotaryEmbeddingTorchCompiledOp(RotaryEmbeddingOp):
     def vendor_impl(self):
         super().vendor_impl()

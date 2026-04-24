@@ -9,6 +9,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import MoeGatherOp as _MoeGatherBaseOp
 
 try:
     import torch
@@ -167,3 +168,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": _MoeGatherBaseOp}

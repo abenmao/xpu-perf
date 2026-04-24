@@ -6,7 +6,7 @@ import subprocess
 
 sys.path.insert(
     0,
-    str(pathlib.Path(__file__).absolute().parents[4])
+    str(pathlib.Path(__file__).absolute().parents[5])
 )
 
 from core.op import ProviderRegistry
@@ -15,7 +15,7 @@ from core.ops.llm_ops import FlashAttentionOp
 try:
     # Resolve sycl-tla path relative to xpu-perf root (xpu-perf/../sycl-tla)
     # flash_attention.py -> ops -> INTEL -> backends -> micro_perf -> xpu-perf
-    _XPU_PERF_ROOT = pathlib.Path(__file__).resolve().parents[4]
+    _XPU_PERF_ROOT = pathlib.Path(__file__).resolve().parents[5]
     SYCL_TLA_DIR = str(_XPU_PERF_ROOT.parent / "sycl-tla")
     SYCL_TLA_BUILD_DIR = os.path.join(
         SYCL_TLA_DIR, "build/examples/06_bmg_flash_attention"
@@ -42,6 +42,10 @@ try:
         # Supported head dims per the sycl-tla CMakeLists.txt
         SUPPORTED_HDIMS = [64, 96, 128, 192]
 
+        # sycl-tla uses the same element type for K/V and KV cache, so int8 KV
+        # cache is not supported by the current flash attention examples.
+        SUPPORTED_KV_CACHE_DTYPES = ["bfloat16"]
+
         # Dtype mapping from framework names to sycl-tla binary name components
         DTYPE_MAP = {
             "bfloat16": "bfloat16",
@@ -50,6 +54,8 @@ try:
 
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
+
+            self._validate_supported_config()
 
             if self.head_dim not in self.SUPPORTED_HDIMS:
                 raise ValueError(
@@ -62,6 +68,15 @@ try:
             # Override run to no-op; benchmarking was done by the binary
             self._run_func = lambda tensor_mapping: None
             self._create_tensors_func = lambda instance_num: [{}] * max(instance_num, 1)
+
+        def _validate_supported_config(self):
+            if self.cache_dtype not in self.SUPPORTED_KV_CACHE_DTYPES:
+                raise ValueError(
+                    "SyclTlaFAOp does not support kv cache dtype "
+                    f"'{self.cache_dtype}'. sycl-tla flash attention uses the "
+                    "same element type for K/V and KV cache, and the current "
+                    f"example binaries only support {self.SUPPORTED_KV_CACHE_DTYPES}."
+                )
 
         def _get_binary_path(self):
             binary_dtype = self.DTYPE_MAP.get(self.cache_dtype, "bfloat16")

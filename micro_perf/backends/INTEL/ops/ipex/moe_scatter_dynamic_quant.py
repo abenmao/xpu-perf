@@ -12,6 +12,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import MoeScatterDynamicQuantOp
 
 try:
     torch.ops.torch_ipex.moe_scatter_dynamic_quant
@@ -280,3 +281,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": MoeScatterDynamicQuantOp}

@@ -13,6 +13,8 @@
             "arg_type": "llm",
             "dtype": "float16",
             "num_tokens": [40, 80, 4096],
+            "norm_head_start": [0],
+            "norm_head_num": [96, 8],
             "head_dim": [128],
             "total_head_num": [96, 8]
         }

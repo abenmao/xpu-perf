@@ -12,6 +12,7 @@ sys.path.insert(
 
 from core.op import ProviderRegistry, BasicOp
 from core.utils import OpTensorInfo, calc_tensor_size
+from core.ops.llm_ops import QuantMatmulOp
 
 try:
     torch.ops.torch_ipex.mm_w8a8
@@ -131,3 +132,5 @@ try:
 
 except Exception:
     pass
+
+OP_MAPPING = {"torch": QuantMatmulOp}

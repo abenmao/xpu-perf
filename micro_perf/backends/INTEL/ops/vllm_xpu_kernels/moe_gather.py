@@ -19,83 +19,54 @@ try:
     class VLLMXPUKernelsMoeGatherOp(MoeGatherOp):
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
+
             self.extra_providers = ["vllm_xpu_kernels"]
+            
+            self._create_tensors_func = partial(
+                self._create_in_out_tensors,
+                create_inputs=True,
+                create_outputs=True,
+            )
+            self._run_func = self.vendor_impl_run
 
         def vendor_parser(self):
-            if self.dtype not in ["float16", "bfloat16", "float32"]:
+            if self.dtype in ["bfloat16","float16"]:
+                pass
+            else:
                 raise ValueError(
-                    "VLLMXPUKernelsMoeGatherOp only supports float16, "
-                    f"bfloat16, and float32, but got {self.dtype}"
+                    f"MoeGatherOp base impl only support bfloat16 float16 dtype, but got {self.dtype}"
                 )
-
+        
         def vendor_impl(self):
-            self.torch_dtype = getattr(torch, self.dtype)
-            flat_topk_weights = [
-                weight
-                for token_weights in self.all_select_weights
-                for weight in token_weights
-            ]
+            super().vendor_impl()
 
-            expert_first_token_offset = [0]
-            for token_count in self.expert_dispatch_token_count:
-                expert_first_token_offset.append(
-                    expert_first_token_offset[-1] + token_count
-                )
+            flat_topk_weights, unpermuted_row_to_permuted_row, expert_first_token_offset = \
+                self._build_vllm_moe_gather_inputs()
 
-            unpermuted_row_to_permuted_row = []
-            expert_local_row_offsets = [0] * self.num_experts_per_rank
-            for token_experts in self.all_select_experts:
-                for expert_idx in token_experts:
-                    if self.experts_start_idx <= expert_idx < self.experts_end_idx:
-                        local_expert_idx = expert_idx - self.experts_start_idx
-                        row_idx = (
-                            expert_first_token_offset[local_expert_idx]
-                            + expert_local_row_offsets[local_expert_idx]
-                        )
-                        unpermuted_row_to_permuted_row.append(row_idx)
-                        expert_local_row_offsets[local_expert_idx] += 1
-                    else:
-                        unpermuted_row_to_permuted_row.append(-1)
-
-            self.input_tensor_info = {
-                "scatter_tokens": OpTensorInfo(
-                    shape=[self.dispatch_tokens, self.hidden_size],
-                    dtype=self.torch_dtype,
-                    device=self.backend.get_torch_device_name(),
+            self.input_tensor_info["topk_weights"] = OpTensorInfo(
+                shape=[self.num_tokens, self.topk],
+                dtype=torch.float32,
+                device=self.backend.get_torch_device_name(),
+                creator=partial(create_from_list, data=flat_topk_weights),
+            )
+            self.input_tensor_info["unpermuted_row_to_permuted_row"] = OpTensorInfo(
+                shape=[self.num_tokens * self.topk],
+                dtype=torch.int32,
+                device=self.backend.get_torch_device_name(),
+                creator=partial(
+                    create_from_list,
+                    data=unpermuted_row_to_permuted_row,
                 ),
-                "topk_weights": OpTensorInfo(
-                    shape=[self.num_tokens, self.topk],
-                    dtype=torch.float32,
-                    device=self.backend.get_torch_device_name(),
-                    creator=partial(create_from_list, data=flat_topk_weights),
+            )
+            self.input_tensor_info["expert_first_token_offset"] = OpTensorInfo(
+                shape=[self.num_experts_per_rank + 1],
+                dtype=torch.int64,
+                device=self.backend.get_torch_device_name(),
+                creator=partial(
+                    create_from_list,
+                    data=expert_first_token_offset,
                 ),
-                "unpermuted_row_to_permuted_row": OpTensorInfo(
-                    shape=[self.num_tokens * self.topk],
-                    dtype=torch.int32,
-                    device=self.backend.get_torch_device_name(),
-                    creator=partial(
-                        create_from_list,
-                        data=unpermuted_row_to_permuted_row,
-                    ),
-                ),
-                "expert_first_token_offset": OpTensorInfo(
-                    shape=[self.num_experts_per_rank + 1],
-                    dtype=torch.int64,
-                    device=self.backend.get_torch_device_name(),
-                    creator=partial(
-                        create_from_list,
-                        data=expert_first_token_offset,
-                    ),
-                ),
-            }
-            self.output_tensor_info = {
-                "convergent_tokens": OpTensorInfo(
-                    shape=[self.num_tokens, self.hidden_size],
-                    dtype=self.torch_dtype,
-                    device=self.backend.get_torch_device_name(),
-                    creator=torch.zeros,
-                ),
-            }
+            )
 
             self.input_tensor_size = sum(
                 calc_tensor_size(info) for info in self.input_tensor_info.values()
@@ -109,18 +80,38 @@ try:
             self.write_bytes = self.output_tensor_size
             self.io_bytes = self.read_bytes + self.write_bytes
 
-            self.algo_size = 0
-            self.bus_size = 0
+        def _build_vllm_moe_gather_inputs(self):
+            flat_topk_weights = [0.0] * (self.num_tokens * self.topk)
+            unpermuted_row_to_permuted_row = [-1] * (self.num_tokens * self.topk)
 
-            self._create_tensors_func = partial(
-                self._create_in_out_tensors,
-                create_inputs=True,
-                create_outputs=True,
+            expert_first_token_offset = [0]
+            for token_count in self.expert_dispatch_token_count:
+                expert_first_token_offset.append(
+                    expert_first_token_offset[-1] + token_count
+                )
+
+            token_fill_count = [0] * self.num_tokens
+            for row_idx, token_idx in enumerate(self.scatter_token_id):
+                slot_idx = token_fill_count[token_idx]
+                if slot_idx >= self.topk:
+                    continue
+
+                target_idx = token_idx * self.topk + slot_idx
+                flat_topk_weights[target_idx] = self.scatter_token_weight[row_idx]
+                unpermuted_row_to_permuted_row[target_idx] = row_idx
+                token_fill_count[token_idx] += 1
+
+            return (
+                flat_topk_weights,
+                unpermuted_row_to_permuted_row,
+                expert_first_token_offset,
             )
-            self._run_func = self.vendor_impl_run
+
+            
 
         def vendor_impl_run(self, tensor_mapping):
             scatter_tokens = tensor_mapping["scatter_tokens"]
+            residual_tokens = tensor_mapping["residual_tokens"]
             topk_weights = tensor_mapping["topk_weights"]
             unpermuted_row_to_permuted_row = tensor_mapping[
                 "unpermuted_row_to_permuted_row"
@@ -139,6 +130,9 @@ try:
                 expert_first_token_offset,
                 self.num_experts_per_rank,
             )
+            # convergent_tokens[
+            #     self.res_token_start:self.res_token_end
+            # ] += residual_tokens * self.res_scale
             return convergent_tokens
 
 except Exception:

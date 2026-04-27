@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
 
 #include <sycl/sycl.hpp>
 
@@ -14,9 +15,8 @@ namespace py = pybind11;
 
 namespace {
 
-inline sycl::queue& get_cached_queue() {
-  static thread_local sycl::queue q{sycl::gpu_selector_v};
-  return q;
+inline sycl::queue& get_current_queue() {
+  return c10::xpu::getCurrentXPUStream().queue();
 }
 
 template <typename scalar_t>
@@ -95,7 +95,7 @@ void reduce_max_compute_into_impl(
   auto* d_min = reinterpret_cast<scalar_t*>(values.data_ptr());
   auto* d_idx = reinterpret_cast<std::int32_t*>(indices.data_ptr());
 
-  sycl::queue& q = get_cached_queue();
+  sycl::queue& q = get_current_queue();
 
   auto run_kernel_baseline = [&]() {
     int wg_size = 256;

@@ -12,6 +12,7 @@
 
 #include <torch/extension.h>
 
+#include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
@@ -162,9 +163,8 @@ bool vectorized_eligible(
 // Top-level dispatch
 // ============================================================
 
-inline sycl::queue& get_cached_queue() {
-  static thread_local sycl::queue q{sycl::gpu_selector_v};
-  return q;
+inline sycl::queue& get_current_queue() {
+  return c10::xpu::getCurrentXPUStream().queue();
 }
 
 void scatter_compute(
@@ -188,7 +188,7 @@ void scatter_compute(
   if (dst.size(1) != dim_size)
     throw std::runtime_error("dst and src must have same dim_size");
 
-  sycl::queue& q = get_cached_queue();
+  sycl::queue& q = get_current_queue();
 
   auto element_size = dst.element_size();
   int64_t slice_bytes = dim_size * element_size;
@@ -222,6 +222,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("index"));
   m.def(
       "sync",
-      []() { get_cached_queue().wait(); },
+      []() { get_current_queue().wait(); },
       "Wait for all previously submitted kernels to finish");
 }

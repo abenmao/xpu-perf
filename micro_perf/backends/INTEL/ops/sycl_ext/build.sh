@@ -92,7 +92,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     scatter_kernel.cpp \
     -o scatter_sycl.so \
     $TORCH_LIBS \
-    -ltorch -ltorch_python -lc10
+    -ltorch -ltorch_python -lc10 -lc10_xpu
 
 echo "Built: $SCRIPT_DIR/scatter_sycl.so"
 ls -la scatter_sycl.so

@@ -586,11 +586,15 @@ torch::Tensor head_rms_norm_forward(
   TORCH_CHECK(gamma.is_xpu(), "gamma must be an XPU tensor");
   TORCH_CHECK(X.is_contiguous(), "X must be contiguous");
   TORCH_CHECK(gamma.is_contiguous(), "gamma must be contiguous");
-  TORCH_CHECK(X.scalar_type() == gamma.scalar_type(), "X and gamma must have same dtype");
   TORCH_CHECK(X.dim() == 2 || X.dim() == 3, "X must be 2D or 3D");
   TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D");
   TORCH_CHECK(norm_head_start >= 0, "norm_head_start must be non-negative");
   TORCH_CHECK(norm_head_num >= 0, "norm_head_num must be non-negative");
+
+  const torch::Tensor gamma_cast =
+      (gamma.scalar_type() == X.scalar_type())
+      ? gamma
+      : gamma.to(X.scalar_type());
 
   HeadSelection selection{0, 1, 0, 0, 1};
   int64_t M = 0;
@@ -624,7 +628,7 @@ torch::Tensor head_rms_norm_forward(
     selection.norm_head_num = effective_norm_head_num;
   }
 
-  TORCH_CHECK(gamma.size(0) == N, "gamma size must match head_dim of X");
+  TORCH_CHECK(gamma_cast.size(0) == N, "gamma size must match head_dim of X");
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -638,7 +642,7 @@ torch::Tensor head_rms_norm_forward(
             float>::type;
         head_rms_norm_kernel_impl<scalar_t, acc_t>(
             X,
-            gamma,
+          gamma_cast,
             M,
             N,
             static_cast<acc_t>(eps),

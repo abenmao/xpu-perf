@@ -75,7 +75,6 @@ inline int next_pow2(int val) {
 
 template <
     typename T,
-    typename T_ACC,
     int UNROLL,
     int threadsPerGroup,
     int maxThreads>
@@ -242,9 +241,6 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
       }
     }
 
-    if (tid == 0 && rstd_ != nullptr) {
-      rstd_[row_idx] = static_cast<T_ACC>(denom);
-    }
   }
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -260,7 +256,6 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
       const T* X,
       const T* gamma,
       T* Y,
-      T_ACC* rstd,
       bool aligned_mode)
       : N_(N),
         M_(M),
@@ -268,7 +263,6 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
         X_(X),
         gamma_(gamma),
         Y_(Y),
-        rstd_(rstd),
         aligned_mode_(aligned_mode) {}
 
  private:
@@ -278,12 +272,11 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
   const T* X_;
   const T* gamma_;
   T* Y_;
-  T_ACC* rstd_;
   bool aligned_mode_;
   sycl_local_acc_t<float> shared_;
 };
 
-template <typename T, typename T_ACC, int TPB>
+template <typename T, int TPB>
 struct RmsNormLargeNKernelFunctor
     : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int T_per_load =
@@ -395,9 +388,6 @@ struct RmsNormLargeNKernelFunctor
       }
     }
 
-    if (tid == 0 && rstd_ != nullptr) {
-      rstd_[row] = static_cast<T_ACC>(denom);
-    }
   }
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -411,7 +401,6 @@ struct RmsNormLargeNKernelFunctor
       const T* X,
       const T* gamma,
       T* Y,
-      T_ACC* rstd,
       bool can_vec)
       : N_(N),
         M_(M),
@@ -419,7 +408,6 @@ struct RmsNormLargeNKernelFunctor
         X_(X),
         gamma_(gamma),
         Y_(Y),
-        rstd_(rstd),
         can_vec_(can_vec) {}
 
  private:
@@ -429,20 +417,18 @@ struct RmsNormLargeNKernelFunctor
   const T* X_;
   const T* gamma_;
   T* Y_;
-  T_ACC* rstd_;
   bool can_vec_;
   sycl_local_acc_t<float> shared_;
 };
 
-template <typename T, typename T_ACC>
+template <typename T>
 void launch_rms_norm_large_n_kernel(
     int N,
     int M,
     float eps,
     const T* X,
     const T* gamma,
-    T* Y,
-    T_ACC* rstd) {
+  T* Y) {
   constexpr int TPB = 256;
   constexpr int T_per_load =
       rms_norm_impl_detail::granularity / sizeof(T);
@@ -452,8 +438,8 @@ void launch_rms_norm_large_n_kernel(
       can_vectorize(X, alignment) && can_vectorize(Y, alignment) &&
       (gamma == nullptr || can_vectorize(gamma, alignment));
 
-  using KernelClass = RmsNormLargeNKernelFunctor<T, T_ACC, TPB>;
-  KernelClass kfn(N, M, eps, X, gamma, Y, rstd, can_vec);
+  using KernelClass = RmsNormLargeNKernelFunctor<T, TPB>;
+  KernelClass kfn(N, M, eps, X, gamma, Y, can_vec);
   sycl::range<1> local_range(static_cast<size_t>(TPB));
   sycl::range<1> global_range(static_cast<size_t>(M) * TPB);
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
@@ -463,7 +449,7 @@ void launch_rms_norm_large_n_kernel(
 #define LAUNCH_RMS_NORM_IPEX(UNROLL_VAL, TPG, MAXT)                         \
   do {                                                                       \
     using KernelClass =                                                      \
-        RmsNormKernelFunctor<T, T_ACC, UNROLL_VAL, TPG, MAXT>;              \
+        RmsNormKernelFunctor<T, UNROLL_VAL, TPG, MAXT>;                     \
     KernelClass kfn(                                                         \
         N_int,                                                               \
         M_int,                                                               \
@@ -471,7 +457,6 @@ void launch_rms_norm_large_n_kernel(
         X_data,                                                              \
         gamma_data,                                                          \
         Y_data,                                                              \
-        rstd_data,                                                           \
         aligned_mode);                                                       \
     sycl::range<2> local_range{                                              \
         static_cast<size_t>(groups_per_block), static_cast<size_t>(TPG)};    \
@@ -488,8 +473,7 @@ void rms_norm_kernel_impl(
     int64_t M,
     int64_t N,
     T_ACC eps,
-    at::Tensor* Y,
-    at::Tensor* rstd) {
+  at::Tensor* Y) {
   constexpr int T_per_load =
       rms_norm_impl_detail::granularity / sizeof(T);
 
@@ -497,19 +481,17 @@ void rms_norm_kernel_impl(
   const T* gamma_data =
       gamma.defined() ? gamma.const_data_ptr<T>() : nullptr;
   T* Y_data = Y->data_ptr<T>();
-  T_ACC* rstd_data = rstd->data_ptr<T_ACC>();
 
   constexpr int kIpexMaxN = 16384;
 
   if (N > kIpexMaxN) {
-    launch_rms_norm_large_n_kernel<T, T_ACC>(
+    launch_rms_norm_large_n_kernel<T>(
         static_cast<int>(N),
         static_cast<int>(M),
         static_cast<float>(eps),
         X_data,
         gamma_data,
-        Y_data,
-        rstd_data);
+        Y_data);
     return;
   }
 
@@ -601,7 +583,6 @@ torch::Tensor rms_norm_forward(
 
   auto X_2d = (X.dim() == 2) ? X : X.view({M, N});
   auto Y_2d = torch::empty_like(X_2d);
-  auto rstd = torch::empty({M}, X.options().dtype(torch::kFloat));
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -616,8 +597,7 @@ torch::Tensor rms_norm_forward(
             M,
             N,
             static_cast<acc_t>(eps),
-            &Y_2d,
-            &rstd);
+            &Y_2d);
       });
 
   if (X.dim() == 2) {

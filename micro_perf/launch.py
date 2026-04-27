@@ -10,6 +10,68 @@ BYTE_MLPERF_ROOT = FILE_DIR
 BACKENDS_DIR = BYTE_MLPERF_ROOT.joinpath("backends")
 sys.path.insert(0, str(BYTE_MLPERF_ROOT))
 
+
+def _early_pin_xpu_device():
+    """
+    Pin the whole process tree to a single XPU device BEFORE importing torch /
+    intel_extension_for_pytorch. Otherwise those imports enumerate and
+    initialize every visible XPU (driver/context/allocator), which makes
+    `xpu-smi` report all cards as "in use" even though kernels only run on
+    one of them.
+
+    Behavior:
+    - If ZE_AFFINITY_MASK is already set in the environment, do nothing
+      (honor user's setting).
+    - Otherwise, peek at `--device` from sys.argv. If it specifies a single
+      integer device id (e.g. `--device 2`), set
+      `ZE_AFFINITY_MASK=<id>` and rewrite the argv to `--device 0` because
+      after masking the only visible XPU has index 0.
+    - If `--device` lists multiple ids or is absent, do not pin.
+    """
+    if os.environ.get("ZE_AFFINITY_MASK"):
+        return
+
+    argv = sys.argv
+    dev_val = None
+    dev_pos = None  # (index_of_value, was_equals_form)
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--device" and i + 1 < len(argv):
+            dev_val = argv[i + 1]
+            dev_pos = (i + 1, False)
+            break
+        if a.startswith("--device="):
+            dev_val = a.split("=", 1)[1]
+            dev_pos = (i, True)
+            break
+        i += 1
+
+    if dev_val is None:
+        return
+
+    parts = [p for p in dev_val.split(",") if p != ""]
+    if len(parts) != 1:
+        # multi-device or empty -- do not auto-pin
+        return
+    try:
+        phys_id = int(parts[0])
+    except ValueError:
+        return
+
+    os.environ["ZE_AFFINITY_MASK"] = str(phys_id)
+    # rewrite argv so that downstream `--device` validation passes
+    if dev_pos[1]:
+        argv[dev_pos[0]] = "--device=0"
+    else:
+        argv[dev_pos[0]] = "0"
+    print(f"[launch.py] auto-pin: ZE_AFFINITY_MASK={phys_id} (from --device); "
+          f"rewrote --device to 0 (post-mask index)")
+
+
+_early_pin_xpu_device()
+
+
 import torch
 import torch.multiprocessing as mp
 

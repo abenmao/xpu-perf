@@ -96,3 +96,17 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
 
 echo "Built: $SCRIPT_DIR/scatter_sycl.so"
 ls -la scatter_sycl.so
+
+echo ""
+echo "Building rms_norm SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=rms_norm_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    rms_norm.cpp \
+    -o rms_norm_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+echo "Built: $SCRIPT_DIR/rms_norm_sycl.so"
+ls -la rms_norm_sycl.so

@@ -38,9 +38,29 @@ try:
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["sycl_ext"]
 
+        def vendor_parser(self):
+            """Extend base parser to accept float8/float8_e4m3 cache_dtype."""
+            if self.dtype == "bfloat16" and self.cache_dtype in ("float8", "float8_e4m3"):
+                self.use_quant = True
+            else:
+                super().vendor_parser()
+
         def vendor_impl(self):
-            """Reuse base class tensor setup, override run func."""
+            """Reuse base class tensor setup, override IO model and run func."""
             super().vendor_impl()
+
+            # IO model: kernel reads KV portion of packed_qkv and writes new tokens to k_cache/v_cache
+            src_elem_size = torch.tensor([], dtype=self.torch_dtype).element_size()
+            dst_elem_size = torch.tensor([], dtype=self.cache_torch_dtype).element_size()
+            kv_tokens_elems = self.num_tokens * self.kv_head_num * self.head_dim * 2  # K + V
+
+            self.read_bytes = kv_tokens_elems * src_elem_size
+            self.write_bytes = kv_tokens_elems * dst_elem_size
+            if self.use_quant:
+                # per-channel static scale: kv_head_num * head_dim * 2(K+V), read once
+                self.read_bytes += self.kv_head_num * self.head_dim * 2 * 4  # float32 scales
+            self.io_bytes = self.read_bytes + self.write_bytes
+
             self._run_func = self.sycl_store_kv_cache_run
 
         def sycl_store_kv_cache_run(self, tensor_mapping):
@@ -57,12 +77,20 @@ try:
             if self.use_quant:
                 k_scale = tensor_mapping["k_scale"]
                 v_scale = tensor_mapping["v_scale"]
-                _sycl_ext.store_kv_cache_int8(
-                    packed_qkv, k_cache, v_cache,
-                    k_scale, v_scale,
-                    k_head_start, self.kv_head_num,
-                    bs, q_len, cache_len
-                )
+                if self.cache_dtype in ("float8", "float8_e4m3"):
+                    _sycl_ext.store_kv_cache_fp8(
+                        packed_qkv, k_cache, v_cache,
+                        k_scale, v_scale,
+                        k_head_start, self.kv_head_num,
+                        bs, q_len, cache_len
+                    )
+                else:
+                    _sycl_ext.store_kv_cache_int8(
+                        packed_qkv, k_cache, v_cache,
+                        k_scale, v_scale,
+                        k_head_start, self.kv_head_num,
+                        bs, q_len, cache_len
+                    )
             else:
                 _sycl_ext.store_kv_cache_bf16(
                     packed_qkv, k_cache, v_cache,

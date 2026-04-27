@@ -1,4 +1,4 @@
-// RMS Norm SYCL extension for xpu-perf.
+// Head RMS Norm SYCL extension for xpu-perf.
 // Ported from dbg/A/src/ATen/native/xpu/sycl/LayerNormKernels.cpp (rms_norm path).
 
 #include <ATen/ATen.h>
@@ -28,6 +28,26 @@ template <typename T, int N>
 struct alignas(16) aligned_vector {
   T val[N];
 };
+
+struct HeadSelection {
+  int use_head_selection;
+  int64_t total_heads;
+  int64_t head_dim;
+  int64_t norm_head_start;
+  int64_t norm_head_num;
+};
+
+inline int64_t head_row_offset(int64_t row_idx, const HeadSelection& selection) {
+  if (!selection.use_head_selection) {
+    return row_idx * selection.head_dim;
+  }
+
+  const int64_t token_idx = row_idx / selection.norm_head_num;
+  const int64_t head_idx = row_idx - token_idx * selection.norm_head_num;
+  return ((token_idx * selection.total_heads) +
+          selection.norm_head_start +
+          head_idx) * selection.head_dim;
+}
 
 template <typename T>
 bool can_vectorize(const T* ptr, int alignment) {
@@ -59,7 +79,7 @@ inline void sycl_kernel_submit(
   });
 }
 
-namespace rms_norm_impl_detail {
+namespace head_rms_norm_impl_detail {
 
 constexpr int granularity = 16;
 
@@ -71,16 +91,16 @@ inline int next_pow2(int val) {
   return result;
 }
 
-} // namespace rms_norm_impl_detail
+} // namespace head_rms_norm_impl_detail
 
 template <
     typename T,
     int UNROLL,
     int threadsPerGroup,
     int maxThreads>
-struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
+struct HeadRMSNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int T_per_load =
-      rms_norm_impl_detail::granularity / sizeof(T);
+      head_rms_norm_impl_detail::granularity / sizeof(T);
 
   SYCL_REQD_SUB_GROUP_SIZE(SIMD)
   void operator()(sycl::nd_item<2> item_id) const {
@@ -98,7 +118,7 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int stride = threadsPerGroup * T_per_load;
 
     float var_sum = 0.f;
-    const T* input_base = X_ + static_cast<int64_t>(row_idx) * N_;
+    T* row_data = X_ + head_row_offset(static_cast<int64_t>(row_idx), selection_);
 
     T local_buffer[UNROLL * T_per_load];
 
@@ -112,7 +132,7 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
         if (do_loads) {
           using vec_t = aligned_vector<T, T_per_load>;
           *reinterpret_cast<vec_t*>(iteration_buffer) =
-              *reinterpret_cast<const vec_t*>(input_base + iter_offset);
+              *reinterpret_cast<const vec_t*>(row_data + iter_offset);
         } else {
 #pragma unroll
           for (int j = 0; j < T_per_load; j++) {
@@ -128,7 +148,7 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
 #pragma unroll
         for (int j = 0; j < T_per_load; j++) {
           const int idx = iter_offset + j;
-          T v = (idx < N_) ? input_base[idx] : T(0);
+          T v = (idx < N_) ? row_data[idx] : T(0);
           iteration_buffer[j] = v;
           float up_cast = static_cast<float>(v);
           var_sum += up_cast * up_cast;
@@ -186,8 +206,6 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float var = var_sum / static_cast<float>(N_);
     const float denom = sycl::rsqrt(var + epsilon_);
 
-    T* block_output = Y_ + static_cast<int64_t>(row_idx) * N_;
-
 #pragma unroll
     for (int i = 0; i < UNROLL; i++) {
       T* iteration_buffer = local_buffer + i * T_per_load;
@@ -227,7 +245,7 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
       if (aligned_mode_) {
         if (iter_offset < N_) {
           using vec_t = aligned_vector<T, T_per_load>;
-          *reinterpret_cast<vec_t*>(block_output + iter_offset) =
+          *reinterpret_cast<vec_t*>(row_data + iter_offset) =
               *reinterpret_cast<const vec_t*>(iteration_buffer);
         }
       } else {
@@ -235,12 +253,11 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
         for (int j = 0; j < T_per_load; j++) {
           const int idx = iter_offset + j;
           if (idx < N_) {
-            block_output[idx] = iteration_buffer[j];
+            row_data[idx] = iteration_buffer[j];
           }
         }
       }
     }
-
   }
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -249,38 +266,38 @@ struct RmsNormKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
     shared_ = sycl_local_acc_t<float>(shared_size, cgh);
   }
 
-  RmsNormKernelFunctor(
+  HeadRMSNormKernelFunctor(
       int N,
       int M,
       float epsilon,
-      const T* X,
+      T* X,
       const T* gamma,
-      T* Y,
+      HeadSelection selection,
       bool aligned_mode)
       : N_(N),
         M_(M),
         epsilon_(epsilon),
         X_(X),
         gamma_(gamma),
-        Y_(Y),
+        selection_(selection),
         aligned_mode_(aligned_mode) {}
 
  private:
   int N_;
   int M_;
   float epsilon_;
-  const T* X_;
+  T* X_;
   const T* gamma_;
-  T* Y_;
+  HeadSelection selection_;
   bool aligned_mode_;
   sycl_local_acc_t<float> shared_;
 };
 
 template <typename T, int TPB>
-struct RmsNormLargeNKernelFunctor
+struct HeadRMSNormLargeNKernelFunctor
     : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int T_per_load =
-      rms_norm_impl_detail::granularity / sizeof(T);
+      head_rms_norm_impl_detail::granularity / sizeof(T);
   static constexpr int NWARPS = TPB / SIMD;
 
   SYCL_REQD_SUB_GROUP_SIZE(SIMD)
@@ -291,15 +308,14 @@ struct RmsNormLargeNKernelFunctor
     }
     const int tid = static_cast<int>(item_id.get_local_id(0));
 
-    const T* row_in = X_ + static_cast<int64_t>(row) * N_;
-    T* row_out = Y_ + static_cast<int64_t>(row) * N_;
+    T* row_data = X_ + head_row_offset(static_cast<int64_t>(row), selection_);
 
     float var_sum = 0.f;
     if (can_vec_) {
       using vec_t = aligned_vector<T, T_per_load>;
       const int n_vec = N_ / T_per_load;
       const int tail_start = n_vec * T_per_load;
-      const vec_t* X_vec = reinterpret_cast<const vec_t*>(row_in);
+      const vec_t* X_vec = reinterpret_cast<const vec_t*>(row_data);
       for (int i = tid; i < n_vec; i += TPB) {
         vec_t v = X_vec[i];
 #pragma unroll
@@ -309,12 +325,12 @@ struct RmsNormLargeNKernelFunctor
         }
       }
       for (int i = tail_start + tid; i < N_; i += TPB) {
-        float f = static_cast<float>(row_in[i]);
+        float f = static_cast<float>(row_data[i]);
         var_sum += f * f;
       }
     } else {
       for (int i = tid; i < N_; i += TPB) {
-        float f = static_cast<float>(row_in[i]);
+        float f = static_cast<float>(row_data[i]);
         var_sum += f * f;
       }
     }
@@ -349,11 +365,10 @@ struct RmsNormLargeNKernelFunctor
       using vec_t = aligned_vector<T, T_per_load>;
       const int n_vec = N_ / T_per_load;
       const int tail_start = n_vec * T_per_load;
-      const vec_t* X_vec = reinterpret_cast<const vec_t*>(row_in);
       const vec_t* G_vec = (gamma_ != nullptr)
           ? reinterpret_cast<const vec_t*>(gamma_)
           : nullptr;
-      vec_t* Y_vec = reinterpret_cast<vec_t*>(row_out);
+      vec_t* X_vec = reinterpret_cast<vec_t*>(row_data);
       for (int i = tid; i < n_vec; i += TPB) {
         vec_t v = X_vec[i];
         vec_t g;
@@ -369,94 +384,94 @@ struct RmsNormLargeNKernelFunctor
           }
           out.val[j] = static_cast<T>(val);
         }
-        Y_vec[i] = out;
+        X_vec[i] = out;
       }
       for (int i = tail_start + tid; i < N_; i += TPB) {
-        float val = static_cast<float>(row_in[i]) * denom;
+        float val = static_cast<float>(row_data[i]) * denom;
         if (gamma_ != nullptr) {
           val *= static_cast<float>(gamma_[i]);
         }
-        row_out[i] = static_cast<T>(val);
+        row_data[i] = static_cast<T>(val);
       }
     } else {
       for (int i = tid; i < N_; i += TPB) {
-        float val = static_cast<float>(row_in[i]) * denom;
+        float val = static_cast<float>(row_data[i]) * denom;
         if (gamma_ != nullptr) {
           val *= static_cast<float>(gamma_[i]);
         }
-        row_out[i] = static_cast<T>(val);
+        row_data[i] = static_cast<T>(val);
       }
     }
-
   }
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     shared_ = sycl_local_acc_t<float>(NWARPS, cgh);
   }
 
-  RmsNormLargeNKernelFunctor(
+  HeadRMSNormLargeNKernelFunctor(
       int N,
       int M,
       float epsilon,
-      const T* X,
+      T* X,
       const T* gamma,
-      T* Y,
+      HeadSelection selection,
       bool can_vec)
       : N_(N),
         M_(M),
         epsilon_(epsilon),
         X_(X),
         gamma_(gamma),
-        Y_(Y),
+        selection_(selection),
         can_vec_(can_vec) {}
 
  private:
   int N_;
   int M_;
   float epsilon_;
-  const T* X_;
+  T* X_;
   const T* gamma_;
-  T* Y_;
+  HeadSelection selection_;
   bool can_vec_;
   sycl_local_acc_t<float> shared_;
 };
 
 template <typename T>
-void launch_rms_norm_large_n_kernel(
+void launch_head_rms_norm_large_n_kernel(
     int N,
     int M,
     float eps,
-    const T* X,
+    T* X,
     const T* gamma,
-  T* Y) {
+    HeadSelection selection) {
   constexpr int TPB = 256;
   constexpr int T_per_load =
-      rms_norm_impl_detail::granularity / sizeof(T);
+      head_rms_norm_impl_detail::granularity / sizeof(T);
   constexpr int alignment = T_per_load * sizeof(T);
 
+  T* row0_data = X + head_row_offset(0, selection);
   const bool can_vec = (N % T_per_load == 0) && (N >= T_per_load) &&
-      can_vectorize(X, alignment) && can_vectorize(Y, alignment) &&
+      can_vectorize(row0_data, alignment) &&
       (gamma == nullptr || can_vectorize(gamma, alignment));
 
-  using KernelClass = RmsNormLargeNKernelFunctor<T, TPB>;
-  KernelClass kfn(N, M, eps, X, gamma, Y, can_vec);
+  using KernelClass = HeadRMSNormLargeNKernelFunctor<T, TPB>;
+  KernelClass kfn(N, M, eps, X, gamma, selection, can_vec);
   sycl::range<1> local_range(static_cast<size_t>(TPB));
   sycl::range<1> global_range(static_cast<size_t>(M) * TPB);
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   sycl_kernel_submit(global_range, local_range, queue, kfn);
 }
 
-#define LAUNCH_RMS_NORM_IPEX(UNROLL_VAL, TPG, MAXT)                         \
+#define LAUNCH_HEAD_RMS_NORM_IPEX(UNROLL_VAL, TPG, MAXT)                    \
   do {                                                                       \
     using KernelClass =                                                      \
-        RmsNormKernelFunctor<T, UNROLL_VAL, TPG, MAXT>;                     \
+        HeadRMSNormKernelFunctor<T, UNROLL_VAL, TPG, MAXT>;                 \
     KernelClass kfn(                                                         \
         N_int,                                                               \
         M_int,                                                               \
         eps_f,                                                               \
         X_data,                                                              \
         gamma_data,                                                          \
-        Y_data,                                                              \
+        selection,                                                           \
         aligned_mode);                                                       \
     sycl::range<2> local_range{                                              \
         static_cast<size_t>(groups_per_block), static_cast<size_t>(TPG)};    \
@@ -467,31 +482,34 @@ void launch_rms_norm_large_n_kernel(
   } while (0)
 
 template <typename T, typename T_ACC>
-void rms_norm_kernel_impl(
-    const at::Tensor& X,
+void head_rms_norm_kernel_impl(
+    torch::Tensor& X,
     const at::Tensor& gamma,
     int64_t M,
     int64_t N,
     T_ACC eps,
-  at::Tensor* Y) {
+    HeadSelection selection) {
   constexpr int T_per_load =
-      rms_norm_impl_detail::granularity / sizeof(T);
+      head_rms_norm_impl_detail::granularity / sizeof(T);
 
-  const T* X_data = X.const_data_ptr<T>();
+  T* X_data = X.data_ptr<T>();
   const T* gamma_data =
       gamma.defined() ? gamma.const_data_ptr<T>() : nullptr;
-  T* Y_data = Y->data_ptr<T>();
+
+  if (M == 0) {
+    return;
+  }
 
   constexpr int kIpexMaxN = 16384;
 
   if (N > kIpexMaxN) {
-    launch_rms_norm_large_n_kernel<T>(
+    launch_head_rms_norm_large_n_kernel<T>(
         static_cast<int>(N),
         static_cast<int>(M),
         static_cast<float>(eps),
         X_data,
         gamma_data,
-        Y_data);
+        selection);
     return;
   }
 
@@ -507,7 +525,7 @@ void rms_norm_kernel_impl(
       is_subblock_schedule ? T_per_load : T_per_load * internalUnroll;
 
   const int one_step_threads =
-      rms_norm_impl_detail::next_pow2((N_int + h_per_step - 1) / h_per_step);
+      head_rms_norm_impl_detail::next_pow2((N_int + h_per_step - 1) / h_per_step);
   const int threads_per_group =
       (one_step_threads < maxThreads) ? one_step_threads : maxThreads;
 
@@ -525,42 +543,44 @@ void rms_norm_kernel_impl(
 
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
-  constexpr int kAlignBytes = rms_norm_impl_detail::granularity;
+  constexpr int kAlignBytes = head_rms_norm_impl_detail::granularity;
+  T* row0_data = X_data + head_row_offset(0, selection);
   const bool aligned_mode = (N_int % T_per_load == 0) &&
-      can_vectorize(X_data, kAlignBytes) &&
-      can_vectorize(Y_data, kAlignBytes) &&
+      can_vectorize(row0_data, kAlignBytes) &&
       (gamma_data == nullptr || can_vectorize(gamma_data, kAlignBytes));
 
   if (is_subblock_schedule) {
     if (threads_per_group == 1) {
-      LAUNCH_RMS_NORM_IPEX(1, 1, maxThreads);
+      LAUNCH_HEAD_RMS_NORM_IPEX(1, 1, maxThreads);
     } else if (threads_per_group == 2) {
-      LAUNCH_RMS_NORM_IPEX(1, 2, maxThreads);
+      LAUNCH_HEAD_RMS_NORM_IPEX(1, 2, maxThreads);
     } else if (threads_per_group == 4) {
-      LAUNCH_RMS_NORM_IPEX(1, 4, maxThreads);
+      LAUNCH_HEAD_RMS_NORM_IPEX(1, 4, maxThreads);
     } else if (threads_per_group == 8) {
-      LAUNCH_RMS_NORM_IPEX(1, 8, maxThreads);
+      LAUNCH_HEAD_RMS_NORM_IPEX(1, 8, maxThreads);
     } else if (threads_per_group == 16) {
-      LAUNCH_RMS_NORM_IPEX(1, 16, maxThreads);
+      LAUNCH_HEAD_RMS_NORM_IPEX(1, 16, maxThreads);
     } else if (threads_per_group == 32) {
-      LAUNCH_RMS_NORM_IPEX(1, 32, maxThreads);
+      LAUNCH_HEAD_RMS_NORM_IPEX(1, 32, maxThreads);
     }
   } else if (external_unroll == 1) {
-    LAUNCH_RMS_NORM_IPEX(1 * internalUnroll, maxThreads, maxThreads);
+    LAUNCH_HEAD_RMS_NORM_IPEX(1 * internalUnroll, maxThreads, maxThreads);
   } else if (external_unroll == 2) {
-    LAUNCH_RMS_NORM_IPEX(2 * internalUnroll, maxThreads, maxThreads);
+    LAUNCH_HEAD_RMS_NORM_IPEX(2 * internalUnroll, maxThreads, maxThreads);
   } else if (external_unroll == 3) {
-    LAUNCH_RMS_NORM_IPEX(3 * internalUnroll, maxThreads, maxThreads);
+    LAUNCH_HEAD_RMS_NORM_IPEX(3 * internalUnroll, maxThreads, maxThreads);
   } else if (external_unroll == 4) {
-    LAUNCH_RMS_NORM_IPEX(4 * internalUnroll, maxThreads, maxThreads);
+    LAUNCH_HEAD_RMS_NORM_IPEX(4 * internalUnroll, maxThreads, maxThreads);
   }
 }
 
-#undef LAUNCH_RMS_NORM_IPEX
+#undef LAUNCH_HEAD_RMS_NORM_IPEX
 
-torch::Tensor rms_norm_forward(
-    const torch::Tensor& X,
+torch::Tensor head_rms_norm_forward(
+    torch::Tensor X,
     const torch::Tensor& gamma,
+    int64_t norm_head_start,
+    int64_t norm_head_num,
     double eps) {
   TORCH_CHECK(X.is_xpu(), "X must be an XPU tensor");
   TORCH_CHECK(gamma.is_xpu(), "gamma must be an XPU tensor");
@@ -569,48 +589,70 @@ torch::Tensor rms_norm_forward(
   TORCH_CHECK(X.scalar_type() == gamma.scalar_type(), "X and gamma must have same dtype");
   TORCH_CHECK(X.dim() == 2 || X.dim() == 3, "X must be 2D or 3D");
   TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D");
+  TORCH_CHECK(norm_head_start >= 0, "norm_head_start must be non-negative");
+  TORCH_CHECK(norm_head_num >= 0, "norm_head_num must be non-negative");
 
+  HeadSelection selection{0, 1, 0, 0, 1};
   int64_t M = 0;
   int64_t N = 0;
+
   if (X.dim() == 2) {
+    TORCH_CHECK(norm_head_start == 0, "2D X only supports norm_head_start == 0");
+    TORCH_CHECK(norm_head_num == 1, "2D X only supports norm_head_num == 1");
     M = X.size(0);
     N = X.size(1);
+    selection.head_dim = N;
   } else {
-    M = X.size(0) * X.size(1);
+    const int64_t total_heads = X.size(1);
     N = X.size(2);
-  }
-  TORCH_CHECK(gamma.size(0) == N, "gamma size must match last dimension of X");
+    TORCH_CHECK(
+        norm_head_start <= total_heads,
+        "norm_head_start must be within total head count");
+    const int64_t max_norm_head_num = total_heads - norm_head_start;
+    const int64_t effective_norm_head_num =
+        (norm_head_num < max_norm_head_num) ? norm_head_num : max_norm_head_num;
 
-  auto X_2d = (X.dim() == 2) ? X : X.view({M, N});
-  auto Y_2d = torch::empty_like(X_2d);
+    if (effective_norm_head_num == 0) {
+      return X;
+    }
+
+    M = X.size(0) * effective_norm_head_num;
+    selection.use_head_selection = 1;
+    selection.total_heads = total_heads;
+    selection.head_dim = N;
+    selection.norm_head_start = norm_head_start;
+    selection.norm_head_num = effective_norm_head_num;
+  }
+
+  TORCH_CHECK(gamma.size(0) == N, "gamma size must match head_dim of X");
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
       X.scalar_type(),
-      "rms_norm_sycl_ext",
+      "head_rms_norm_sycl_ext",
       [&]() {
-        using acc_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
-        rms_norm_kernel_impl<scalar_t, acc_t>(
-            X_2d,
+        using acc_t = typename std::conditional<
+            std::is_same<scalar_t, double>::value,
+            double,
+            float>::type;
+        head_rms_norm_kernel_impl<scalar_t, acc_t>(
+            X,
             gamma,
             M,
             N,
             static_cast<acc_t>(eps),
-            &Y_2d);
+            selection);
       });
 
-  if (X.dim() == 2) {
-    return Y_2d;
-  }
-  return Y_2d.view_as(X);
+  return X;
 }
 
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
-      "rms_norm_forward",
-      &rms_norm_forward,
-      "RMSNorm forward (SYCL extension)");
+      "head_rms_norm_forward",
+      &head_rms_norm_forward,
+      "Head RMSNorm forward (SYCL extension, inplace)");
 }

@@ -16,11 +16,13 @@ from core.ops.llm_ops import HeadRMSNormOp as BaseHeadRMSNormOp
 
 
 _OP_DIR = pathlib.Path(__file__).resolve().parent
-_SYCL_SO = _OP_DIR / "rms_norm_sycl.so"
+_SYCL_SO = _OP_DIR / "head_rms_norm_sycl.so"
 
 
 try:
-    _spec = importlib.util.spec_from_file_location("rms_norm_sycl", str(_SYCL_SO))
+    _spec = importlib.util.spec_from_file_location("head_rms_norm_sycl", str(_SYCL_SO))
+    if _spec is None or _spec.loader is None:
+        raise ImportError(f"Failed to create import spec for {_SYCL_SO}")
     _sycl_ext = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_sycl_ext)
 
@@ -41,16 +43,8 @@ try:
             data_bytes = per_head_bytes * effective_norm_head_num
             weight_bytes = calc_tensor_size(self.input_tensor_info["norm_weight"])
 
-            # Same accounting model as torch provider: additional contiguous/copy traffic
-            # is only required when the selected head range is a strict subset.
-            need_copy = (effective_norm_head_num < self.total_head_num)
-
-            if need_copy:
-                self.read_bytes = 3 * data_bytes + weight_bytes
-                self.write_bytes = 3 * data_bytes
-            else:
-                self.read_bytes = data_bytes + weight_bytes
-                self.write_bytes = data_bytes
+            self.read_bytes = data_bytes + weight_bytes
+            self.write_bytes = data_bytes
             self.io_bytes = self.read_bytes + self.write_bytes
 
             self._run_func = self.vendor_impl_run
@@ -59,27 +53,19 @@ try:
             token_data = tensor_mapping["token_data"]
             norm_weight = tensor_mapping["norm_weight"]
 
-            head_data = token_data[:, self.norm_head_start:self.norm_head_end, :]
-            if head_data.is_contiguous():
-                head_data_c = head_data
-                need_copy = False
-            else:
-                head_data_c = head_data.contiguous()
-                need_copy = True
-
-            if norm_weight.dtype != head_data_c.dtype:
-                norm_weight = norm_weight.to(head_data_c.dtype)
+            if norm_weight.dtype != token_data.dtype:
+                norm_weight = norm_weight.to(token_data.dtype)
             if not norm_weight.is_contiguous():
                 norm_weight = norm_weight.contiguous()
 
-            normed_data = _sycl_ext.rms_norm_forward(head_data_c, norm_weight, float(self.eps))
-
-            if need_copy:
-                head_data.copy_(normed_data)
-                return token_data
-            else:
-                token_data = normed_data
-                return token_data
+            _sycl_ext.head_rms_norm_forward(
+                token_data,
+                norm_weight,
+                int(self.norm_head_start),
+                int(self.norm_head_num),
+                float(self.eps),
+            )
+            return token_data
 
 except Exception as e:
     import warnings

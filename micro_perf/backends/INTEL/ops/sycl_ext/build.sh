@@ -64,7 +64,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     reduce_min_kernel.cpp \
     -o reduce_min_sycl.so \
     $TORCH_LIBS \
-    -ltorch -ltorch_python -lc10
+    -ltorch -ltorch_python -lc10 -lc10_xpu
 
 echo "Built: $SCRIPT_DIR/reduce_min_sycl.so"
 ls -la reduce_min_sycl.so
@@ -78,7 +78,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     reduce_max_kernel.cpp \
     -o reduce_max_sycl.so \
     $TORCH_LIBS \
-    -ltorch -ltorch_python -lc10
+    -ltorch -ltorch_python -lc10 -lc10_xpu
 
 echo "Built: $SCRIPT_DIR/reduce_max_sycl.so"
 ls -la reduce_max_sycl.so

@@ -113,6 +113,8 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
 
 echo "Built: $SCRIPT_DIR/moe_softmax_topk_sycl.so"
 ls -la moe_softmax_topk_sycl.so
+
+echo ""
 echo "Building scatter SYCL extension..."
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=scatter_sycl \

@@ -101,6 +101,20 @@ echo "Built: $SCRIPT_DIR/reduce_max_sycl.so"
 ls -la reduce_max_sycl.so
 
 echo ""
+echo "Building moe_softmax_topk SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=moe_softmax_topk_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_softmax_topk_kernel.cpp \
+    -o moe_softmax_topk_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+echo "Built: $SCRIPT_DIR/moe_softmax_topk_sycl.so"
+ls -la moe_softmax_topk_sycl.so
+
+echo ""
 echo "Building scatter SYCL extension..."
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=scatter_sycl \

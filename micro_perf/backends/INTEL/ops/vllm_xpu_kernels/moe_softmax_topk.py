@@ -27,28 +27,33 @@ try:
                 create_inputs=True,
                 create_outputs=True,
             )
+            self.output_tensor_info["token_expert_indices"] = OpTensorInfo(
+                shape=[self.num_tokens * self.topk],
+                dtype=torch.int32,
+                device=self.backend.get_torch_device_name(),
+            )
 
+            self.output_tensor_size = sum(
+                calc_tensor_size(info) for info in self.output_tensor_info.values()
+            )
+            self.tensor_size = self.input_tensor_size + self.output_tensor_size
+            self.write_bytes = self.output_tensor_size
+            self.io_bytes = self.read_bytes + self.write_bytes   
+        
         def vendor_impl_run(self, tensor_mapping):
             gating_output = tensor_mapping["gating_output"]
             selected_experts = tensor_mapping["selected_experts"]
             moe_weights = tensor_mapping["moe_weights"]
-
+            token_expert_indices = tensor_mapping["token_expert_indices"]
             # _moe_C::topk_softmax needs int32 output for indices
-            topk_indices = selected_experts.to(torch.int32)
-            token_expert_indices = torch.empty(
-                self.num_tokens * self.topk,
-                dtype=torch.int32,
-                device=gating_output.device,
-            )
-
+            
             renormalize = self.compute_mode == "pre-softmax"
             torch.ops._moe_C.topk_softmax(
-                moe_weights, topk_indices, token_expert_indices,
+                moe_weights, selected_experts, token_expert_indices,
                 gating_output, renormalize, None
             )
 
             # copy back int32 indices to the pre-allocated float32 tensor
-            selected_experts.copy_(topk_indices.to(selected_experts.dtype))
             return selected_experts, moe_weights
 
 except Exception:

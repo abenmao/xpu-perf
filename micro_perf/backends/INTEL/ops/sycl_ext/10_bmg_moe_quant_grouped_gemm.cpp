@@ -573,12 +573,12 @@ static cutlass::Status run_with_tile(
 
   // Custom EVT: D_bf16 = bf16(float(s32_acc) * float_combined_scale)
   // Combined scale is pre-computed and passed via the per-group C matrix.
-  using FusionCallbacks = cutlass::epilogue::fusion::Sm90EVT<
-    cutlass::epilogue::fusion::Sm90Compute<
+  using FusionCallbacks = cutlass::epilogue::fusion::XeEVT<
+    cutlass::epilogue::fusion::XeCompute<
       cutlass::multiplies, ElementEpilogueOutput, ElementComputeEpilogue,
       cutlass::FloatRoundStyle::round_to_nearest>,
-    cutlass::epilogue::fusion::Sm90AccFetch,
-    cutlass::epilogue::fusion::Sm90SrcFetch<ElementSource>
+    cutlass::epilogue::fusion::XeAccFetch,
+    cutlass::epilogue::fusion::XeSrcFetch<ElementSource>
   >;
 
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<

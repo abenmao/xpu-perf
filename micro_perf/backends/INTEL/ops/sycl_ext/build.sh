@@ -114,6 +114,20 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
 echo "Built: $SCRIPT_DIR/scatter_sycl.so"
 ls -la scatter_sycl.so
 
+echo ""
+echo "Building head_rms_norm SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=head_rms_norm_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    head_rms_norm.cpp \
+    -o head_rms_norm_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+echo "Built: $SCRIPT_DIR/head_rms_norm_sycl.so"
+ls -la head_rms_norm_sycl.so
+
 echo "Building bmg_moe_gating_gemm_sycl SYCL extension..."
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=bmg_moe_gating_gemm_sycl \

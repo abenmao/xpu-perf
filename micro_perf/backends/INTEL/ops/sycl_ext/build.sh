@@ -109,7 +109,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     moe_softmax_topk_kernel.cpp \
     -o moe_softmax_topk_sycl.so \
     $TORCH_LIBS \
-    -ltorch -ltorch_python -lc10
+    -ltorch -ltorch_python -lc10 -lc10_xpu
 
 echo "Built: $SCRIPT_DIR/moe_softmax_topk_sycl.so"
 ls -la moe_softmax_topk_sycl.so

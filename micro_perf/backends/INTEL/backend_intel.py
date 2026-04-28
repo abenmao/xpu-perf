@@ -24,6 +24,7 @@ sys.path.insert(0, str(MICRO_PERF_DIR))
 
 from core.backend import Backend
 from core.utils import suppress_stdout_stderr
+from backends.INTEL.ops.xccl import run_perf, run_infer_loop
 try:
     from backends.INTEL.provider_intel import INTEL_PROVIDER
 except:
@@ -217,3 +218,23 @@ class BackendINTEL(Backend):
 
             latency_us = start_event.elapsed_time(end_event) * 1e3 / prefer_iterations
             return latency_us, []
+
+    def perf(self, op_instance):
+        """Override base perf() with BCS-aware measurement (empty_cache before
+        allocation, capped max_data_cnt for cross-device ops, reduced iters
+        for large tensors, and per-iter sync for BCS-heavy ops)."""
+        return run_perf(self, op_instance)
+
+    def xccl_infer_loop(
+        self, local_process_rank, process_mapping,
+        input_queue, output_queue,
+        master_addr, xccl_port, node_world_size, node_rank,
+    ):
+        """Override base xccl_infer_loop() to sort batch by world_size
+        descending, avoiding CCL communicator resource deadlock on
+        Intel XE GPUs (PCIe topology, no XeLink)."""
+        return run_infer_loop(
+            self, local_process_rank, process_mapping,
+            input_queue, output_queue,
+            master_addr, xccl_port, node_world_size, node_rank,
+        )

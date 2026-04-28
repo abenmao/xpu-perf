@@ -20,6 +20,10 @@ except Exception:
 
 import torch.distributed as dist
 
+
+def _aligned_token_count(token_count, alignment=256):
+    return (token_count + alignment - 1) // alignment * alignment
+
 #################################### ggemm_w4a8 interface #####################################################
 # n_experts   number of experts  
 # experts_token_count       xpu buffer, int32  shape (n_experts)   indicate each expert token count
@@ -175,10 +179,14 @@ try:
 
             self.dtype = self.args_dict["dtype"]
             quant_group_size = self.args_dict.get("quant_group_size", 128)
-            self.n_experts = self.args_dict.get("n_experts", self.args_dict.get("num_experts", 1))
+            total_experts = self.args_dict.get("n_experts", self.args_dict.get("num_experts", 1))
             ep_size = self.args_dict.get("ep_size", 1)
-            self.n_experts = self.n_experts // ep_size
+            self.n_experts = total_experts // ep_size
             self.topk = self.args_dict.get("topk", 1)
+            self.dispatch_tokens = None
+            self.expert_dispatch_token_count = None
+            self.active_tokens = None
+            self.aligned_active_tokens = None
 
             if self.dtype == "w4a8":
                 self.act_dtype = torch.int8
@@ -218,20 +226,52 @@ try:
                 self.k = self.args_dict.get("k", self.args_dict.get("hidden_size", 0))
                 self.n = self.args_dict.get("n", self.args_dict.get("new_hidden_size", 0))
                 self.m_scattered = self.m * self.topk  
-                print("m_scattered",self.m_scattered)
                 self.group_num = self.k // quant_group_size  if self.dtype=="w4a8" else 1
+                if self.dtype in ["w4a8", "w8a8"]:
+                    self.dispatch_tokens = self.m_scattered // ep_size
+                    token_per_exp = self.dispatch_tokens // self.n_experts
+                    token_rem = self.dispatch_tokens % self.n_experts
+                    self.expert_dispatch_token_count = [token_per_exp] * self.n_experts
+                    for i in range(token_rem):
+                        self.expert_dispatch_token_count[i] += 1
+                    self.active_tokens = sum(self.expert_dispatch_token_count)
+                    self.aligned_active_tokens = sum(
+                        _aligned_token_count(token_count)
+                        for token_count in self.expert_dispatch_token_count
+                    )
             elif self.arg_type == "default":
                 self.M = self.args_dict["M"]
                 self.K = self.args_dict["K"]
                 self.N = self.args_dict["N"]
 
+            if self.dtype in ["w4a8", "w8a8"]:
+                if self.active_tokens is None:
+                    experts_token_count = self.args_dict.get(
+                        "experts_token_count",
+                        [self.m_scattered // self.n_experts] * self.n_experts,
+                    )
+                    self.active_tokens = sum(experts_token_count)
+                    self.aligned_active_tokens = sum(
+                        _aligned_token_count(token_count)
+                        for token_count in experts_token_count
+                    )
+
 
             if self.dtype == "w4a8":
                 init_experts_tensor_count_func = init_experts_tensor_count(self.m_scattered, True)
+                experts_token_count_creator = (
+                    lambda size, dtype, device: torch.tensor(
+                        self.expert_dispatch_token_count,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    if self.expert_dispatch_token_count is not None
+                    else init_experts_tensor_count_func(size, dtype, device)
+                )
 
                 self.input_tensor_info = {
                     "a": OpTensorInfo(
-                        shape=[self.m_scattered, self.k],  
+                        shape=[self.active_tokens, self.k],  
                         dtype=self.act_dtype,
                         device=self.backend.get_torch_device_name()),
                     "b": OpTensorInfo(
@@ -239,7 +279,7 @@ try:
                         dtype=self.weight_dtype,
                         device=self.backend.get_torch_device_name()),
                     "input_scales": OpTensorInfo(
-                        shape=[self.m_scattered + 255*self.n_experts, 1], 
+                        shape=[self.aligned_active_tokens, 1], 
                         dtype=self.scale_dtype,
                         device=self.backend.get_torch_device_name()),
                     "scales": OpTensorInfo(
@@ -254,22 +294,31 @@ try:
                         shape=[self.n_experts], 
                         dtype=torch.int32,
                         device="cpu",
-                        creator=init_experts_tensor_count_func)
+                        creator=experts_token_count_creator)
                 }
                 self.output_tensor_info = {
                     "c": OpTensorInfo(
-                        shape=[self.m_scattered, self.n], 
+                        shape=[self.active_tokens, self.n], 
                         dtype=self.out_dtype,
                         device=self.backend.get_torch_device_name())
                 }
             elif self.dtype == "w8a8":
                 init_experts_tensor_count_func = init_experts_tensor_count(self.m_scattered, True)
+                experts_token_count_creator = (
+                    lambda size, dtype, device: torch.tensor(
+                        self.expert_dispatch_token_count,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    if self.expert_dispatch_token_count is not None
+                    else init_experts_tensor_count_func(size, dtype, device)
+                )
                 trans_w = self.args_dict.get("trans_w", False)
                 w_shape = [self.n_experts, self.k, self.n] if trans_w else [self.n_experts, self.n, self.k]
 
                 self.input_tensor_info = {
                     "a": OpTensorInfo(
-                        shape=[self.m_scattered, self.k],
+                        shape=[self.active_tokens, self.k],
                         dtype=self.act_dtype,
                         device=self.backend.get_torch_device_name()),
                     "b": OpTensorInfo(
@@ -277,7 +326,7 @@ try:
                         dtype=self.weight_dtype, 
                         device=self.backend.get_torch_device_name()),  
                     "input_scales": OpTensorInfo(
-                        shape=[self.m_scattered + 255*self.n_experts, 1], 
+                        shape=[self.aligned_active_tokens, 1], 
                         dtype=self.scale_dtype, 
                         device=self.backend.get_torch_device_name()),
                     "scales": OpTensorInfo(
@@ -292,11 +341,11 @@ try:
                         shape=[self.n_experts], 
                         dtype=torch.int32, 
                         device="cpu",
-                        creator=init_experts_tensor_count_func)
+                        creator=experts_token_count_creator)
                 }
                 self.output_tensor_info = {
                 "c": OpTensorInfo(
-                    shape=[self.m_scattered, self.n], 
+                    shape=[self.active_tokens, self.n], 
                     dtype=self.out_dtype, 
                     device=self.backend.get_torch_device_name())
             }
@@ -311,9 +360,12 @@ try:
             self.io_bytes = self.read_bytes + self.write_bytes
 
             if self.dtype in ["w4a8","w8a8"]:
-                total_tokens = sum(self.args_dict.get("experts_token_count", [self.m_scattered//self.n_experts]*self.n_experts))
-                self.calc_flops = total_tokens * self.n * self.k * 2 
-                print("total_tokens",total_tokens)
+                if self.dispatch_tokens is not None:
+                    total_tokens = self.dispatch_tokens
+                else:
+                    total_tokens = sum(self.args_dict.get("experts_token_count", [self.m_scattered//self.n_experts]*self.n_experts))
+                self.calc_flops = total_tokens * self.n * self.k * 2
+                print("total_tokens", total_tokens)
             else:
 
                 self.calc_flops = self.M * self.N * self.K * 2

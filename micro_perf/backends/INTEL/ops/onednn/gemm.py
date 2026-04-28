@@ -98,6 +98,8 @@ try:
             env["LD_LIBRARY_PATH"] = (
                 ONEDNN_LIB_DIR + ":" + env.get("LD_LIBRARY_PATH", "")
             )
+            device_id = self._select_device_index()
+            env["ZE_AFFINITY_MASK"] = str(device_id)
             return env
 
         def _verify_libdnnl_resolution(self, env):

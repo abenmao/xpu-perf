@@ -54,9 +54,17 @@ try:
             self._run_func = lambda tensor_mapping: None
             self._create_tensors_func = lambda instance_num: [{}] * max(instance_num, 1)
 
+        def _select_device_index(self):
+            try:
+                return int(self.backend.get_device())
+            except Exception:
+                return 0
+
         def _run_sycl_tla(self):
             """Run 00_bmg_gemm example binary and parse text output metrics."""
+            device_id = self._select_device_index()
             cmd = (
+                f'ZE_AFFINITY_MASK={device_id} '
                 'SYCL_PROGRAM_COMPILE_OPTIONS="-ze-opt-large-register-file" '
                 f"{SYCL_TLA_GEMM_EXAMPLE_BINARY} "
                 f"--m={self.M} --n={self.N} --k={self.K} --l=1 "

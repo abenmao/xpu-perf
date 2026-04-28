@@ -85,16 +85,25 @@ try:
             )
             return os.path.join(SYCL_TLA_BUILD_DIR, binary_name)
 
+        def _select_device_index(self):
+            try:
+                return int(self.backend.get_device())
+            except Exception:
+                return 0
+
         def _run_sycl_tla(self):
             binary_path = self._get_binary_path()
             if not os.path.isfile(binary_path):
                 raise FileNotFoundError(f"sycl-tla binary not found: {binary_path}")
+
+            device_id = self._select_device_index()
 
             if self.attn_mode == "prefill":
                 # Prefill: q and kv have the same sequence length per batch element
                 seq_qo = self.q_lens[0]
                 seq_kv = self.kv_lens[0]
                 cmd = (
+                    f"ZE_AFFINITY_MASK={device_id} "
                     f"{binary_path} "
                     f"--iterations=100 --batch={self.batch_size} --verify=0 "
                     f"--num_heads_q={self.q_head_num} --num_heads_kv={self.kv_head_num} "
@@ -107,6 +116,7 @@ try:
                 seq_kv = self.max_q_len  # new KV tokens = new query tokens
                 cache_len = self.max_cache_len
                 cmd = (
+                    f"ZE_AFFINITY_MASK={device_id} "
                     f"{binary_path} "
                     f"--iterations=100 --batch={self.batch_size} --verify=0 "
                     f"--num_heads_q={self.q_head_num} --num_heads_kv={self.kv_head_num} "

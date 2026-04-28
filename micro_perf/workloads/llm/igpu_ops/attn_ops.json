@@ -148,7 +148,7 @@
             "cache_dtype": [
                 "bfloat16"
             ],
-            "mode": "prefill",
+            "attn_mode": "prefill",
             "q_head_num.kv_head_num.head_dim": [
                 [96, 8, 128],
                 [96, 8, 64],
@@ -176,7 +176,6 @@
                 "bfloat16"
             ],
             "attn_mode": "decode",
-            "cache_type": "paged",
             "q_head_num.kv_head_num.head_dim": [
                 [96, 8, 128],
                 [96, 8, 64],

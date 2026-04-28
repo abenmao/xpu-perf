@@ -378,7 +378,6 @@ class Backend(ABC):
 
         try:
             min_test_iters = 10
-            max_test_iters = float("inf")
             sleep_time = 0.2
             max_test_time = 1e6
             max_data_cnt = 1
@@ -399,7 +398,7 @@ class Backend(ABC):
             random.shuffle(tensor_list)
 
             latency_us, _ = self.core_perf(op_instance, 2, 2, tensor_list, profiling=False)
-            prefer_iters = min(max(int(max_test_time / latency_us), min_test_iters), max_test_iters)
+            prefer_iters = max(int(max_test_time / latency_us), min_test_iters)
             if op_instance.group_size > 1:
                 dist_module = self.get_dist_module()
                 prefer_iters_list = [None for _ in range(op_instance.group_size)]

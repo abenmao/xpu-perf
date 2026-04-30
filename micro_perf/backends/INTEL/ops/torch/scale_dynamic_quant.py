@@ -13,9 +13,8 @@ sys.path.insert(
     str(pathlib.Path(__file__).absolute().parents[4])
 )
 
+from core.op import ProviderRegistry
 from core.ops.llm_ops import ScaleDynamicQuantOp
-
-OP_MAPPING = {}
 
 
 # Triton single-pass kernel
@@ -89,7 +88,8 @@ def _get_compiled():
     return fn
 
 
-class ScaleDynamicQuantTorchCompiledOp(ScaleDynamicQuantOp):
+@ProviderRegistry.register_vendor_impl("scale_dynamic_quant", "torch")
+class ScaleDynamicQuantTorchOp(ScaleDynamicQuantOp):
     def vendor_impl(self):
         super().vendor_impl()
         self._create_tensors_func = partial(
@@ -114,6 +114,3 @@ class ScaleDynamicQuantTorchCompiledOp(ScaleDynamicQuantOp):
         else:
             self._compiled_fn(hidden_states, smooth_scale, quant_tokens, per_token_scale)
         return quant_tokens, per_token_scale
-
-
-OP_MAPPING["torch_compiled"] = ScaleDynamicQuantTorchCompiledOp

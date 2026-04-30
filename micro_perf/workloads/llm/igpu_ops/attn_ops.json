@@ -191,7 +191,7 @@
                 [16, 8, 64]
             ],
             "batch_size": [16],
-            "block_size": 512,
+            "block_size": 64,
             "cache_len": [10240],
             "q_len": [
                 1, 4

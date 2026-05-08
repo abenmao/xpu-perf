@@ -34,6 +34,15 @@ struct alignas(4) i8x4_t {
 };
 
 // ---------- kernel functor ----------
+//
+// Optimisation vs v1: keep intermediate float values in private memory
+// across passes so that after_res and after_norm are never *re-read* from
+// global memory.  This cuts global memory traffic from ~25 B/elem to
+// ~17 B/elem (−32 %).
+//
+// Inspired by the ESIMD kernel in IPEX (esimd/src/norm.cpp) which holds
+// all intermediates in SIMD registers across all three fused stages.
+
 template <typename scalar_t>
 class add_rms_norm_dynamic_quant_kernel {
  private:
@@ -49,6 +58,11 @@ class add_rms_norm_dynamic_quant_kernel {
   float const* smooth_scale_;
   int const hidden_size_;
   float const eps_;
+
+  // Max scalar elements any single work-item will process.
+  // With wg_size = 512 this supports hidden_size up to 16 × 512 = 8 192,
+  // covering all common LLM hidden sizes.
+  static constexpr int MAX_PRIV = 16;
 
   static inline int8_t quant_one(float v, float inv_scale) {
     float r = v * inv_scale;
@@ -94,6 +108,10 @@ class add_rms_norm_dynamic_quant_kernel {
     scalar_t* anorm_row = after_norm_ + row_off;
     int8_t* qout_row = quant_out_ + row_off;
 
+    // Private buffer: holds float intermediates across passes so we
+    // never re-read after_res / after_norm from global memory.
+    float priv[MAX_PRIV];
+
     // Check vectorisation feasibility (4-element vectors).
     bool const can_vec = (hidden_size_ % 4 == 0) &&
         ((reinterpret_cast<uintptr_t>(hs_row) & 7u) == 0u) &&
@@ -105,8 +123,12 @@ class add_rms_norm_dynamic_quant_kernel {
     using svec_t = vec4_t<float>;
     int const num_vec = hidden_size_ >> 2;
 
-    // ===== Pass 1: add residual  +  accumulate sum-of-squares =====
+    // ================================================================
+    // Pass 1: add residual  +  accumulate sum-of-squares
+    //         → write after_res to global, keep float values in priv[]
+    // ================================================================
     float thread_sum_sq = 0.0f;
+    int n_priv = 0;
 
     if (can_vec) {
       auto const* hs_v = reinterpret_cast<xvec_t const*>(hs_row);
@@ -125,6 +147,7 @@ class add_rms_norm_dynamic_quant_kernel {
           float val = static_cast<float>(hv.val[j]);
           if (res_v) val += static_cast<float>(rv.val[j]);
           av.val[j] = static_cast<scalar_t>(val);
+          priv[n_priv++] = val;
           thread_sum_sq += val * val;
         }
         ares_v[i] = av;
@@ -134,6 +157,7 @@ class add_rms_norm_dynamic_quant_kernel {
         float val = static_cast<float>(hs_row[i]);
         if (res_row) val += static_cast<float>(res_row[i]);
         ares_row[i] = static_cast<scalar_t>(val);
+        priv[n_priv++] = val;
         thread_sum_sq += val * val;
       }
     }
@@ -142,7 +166,6 @@ class add_rms_norm_dynamic_quant_kernel {
     float const sum_sq = sycl::reduce_over_group(
         item.get_group(), thread_sum_sq, sycl::plus<float>());
 
-    // Shared memory for rstd broadcast.
     auto& sh1 = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         float>(item.get_group());
     if (tid == 0) {
@@ -152,36 +175,42 @@ class add_rms_norm_dynamic_quant_kernel {
     sycl::group_barrier(item.get_group());
     float const rstd = sh1;
 
-    // ===== Pass 2: RMS-norm * weight * smooth_scale  +  absmax =====
+    // ================================================================
+    // Pass 2: RMS-norm × weight → write after_norm to global
+    //         then  × smooth_scale → absmax,  keep scaled in priv[]
+    //         (reads from priv[] instead of re-reading after_res)
+    // ================================================================
     float thread_amax = 0.0f;
+    int pi = 0;
 
     if (can_vec) {
-      auto const* ares_v = reinterpret_cast<xvec_t const*>(ares_row);
       auto const* nw_v = reinterpret_cast<svec_t const*>(norm_weight_);
       auto const* ss_v = reinterpret_cast<svec_t const*>(smooth_scale_);
       auto* anorm_v = reinterpret_cast<xvec_t*>(anorm_row);
 
 #pragma unroll 4
       for (int i = tid; i < num_vec; i += wg) {
-        xvec_t av = ares_v[i];
         svec_t nw = nw_v[i];
         svec_t ss = ss_v[i];
         xvec_t nv;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          float normed = static_cast<float>(av.val[j]) * rstd * nw.val[j];
+          float normed = priv[pi] * rstd * nw.val[j];
           nv.val[j] = static_cast<scalar_t>(normed);
           float scaled = normed * ss.val[j];
+          priv[pi] = scaled;   // reuse slot for pass 3
+          pi++;
           thread_amax = sycl::max(thread_amax, sycl::fabs(scaled));
         }
         anorm_v[i] = nv;
       }
     } else {
       for (int i = tid; i < hidden_size_; i += wg) {
-        float normed =
-            static_cast<float>(ares_row[i]) * rstd * norm_weight_[i];
+        float normed = priv[pi] * rstd * norm_weight_[i];
         anorm_row[i] = static_cast<scalar_t>(normed);
         float scaled = normed * smooth_scale_[i];
+        priv[pi] = scaled;
+        pi++;
         thread_amax = sycl::max(thread_amax, sycl::fabs(scaled));
       }
     }
@@ -203,29 +232,25 @@ class add_rms_norm_dynamic_quant_kernel {
     sycl::group_barrier(item.get_group());
     float const inv_scale = sh2[1];
 
-    // ===== Pass 3: quantise (re-read after_norm + smooth_scale) =====
+    // ================================================================
+    // Pass 3: quantise directly from priv[] — zero global reads
+    // ================================================================
+    pi = 0;
     if (can_vec) {
-      auto const* anorm_v = reinterpret_cast<xvec_t const*>(anorm_row);
-      auto const* ss_v = reinterpret_cast<svec_t const*>(smooth_scale_);
       auto* qout_v = reinterpret_cast<i8x4_t*>(qout_row);
 
 #pragma unroll 4
       for (int i = tid; i < num_vec; i += wg) {
-        xvec_t nv = anorm_v[i];
-        svec_t ss = ss_v[i];
         i8x4_t ov;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          float scaled = static_cast<float>(nv.val[j]) * ss.val[j];
-          ov.v[j] = quant_one(scaled, inv_scale);
+          ov.v[j] = quant_one(priv[pi++], inv_scale);
         }
         qout_v[i] = ov;
       }
     } else {
       for (int i = tid; i < hidden_size_; i += wg) {
-        float scaled =
-            static_cast<float>(anorm_row[i]) * smooth_scale_[i];
-        qout_row[i] = quant_one(scaled, inv_scale);
+        qout_row[i] = quant_one(priv[pi++], inv_scale);
       }
     }
   }
@@ -281,10 +306,18 @@ void add_rms_norm_dynamic_quant_forward(
 
   if (num_tokens == 0) return;
 
+  // Each work-item stores at most ceil(hidden_size / wg_size) elements
+  // in a private buffer.  Guard against exceeding the compiled limit.
+  constexpr int kMaxPriv = 16;   // must match MAX_PRIV in kernel
   int local_size = std::min(hidden_size, 512);
   if (local_size > 32) {
     local_size = (local_size / 32) * 32;
   }
+  int elems_per_wi = (hidden_size + local_size - 1) / local_size;
+  TORCH_CHECK(
+      elems_per_wi <= kMaxPriv,
+      "hidden_size / wg_size exceeds compiled MAX_PRIV (",
+      kMaxPriv, "); got ", elems_per_wi);
   sycl::range<1> grid(static_cast<size_t>(num_tokens));
   sycl::range<1> block(static_cast<size_t>(local_size));
 

@@ -1,0 +1,109 @@
+{
+    "rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "hidden_size": [4096],
+            "num_tokens": [40],
+            "add_residual": [false]
+        }
+    ],
+    "add_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "hidden_size": [4096],
+            "num_tokens": [40],
+            "add_residual": [true]
+        }
+    ],
+    "head_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "num_tokens": [40],
+            "norm_head_start": [0],
+            "norm_head_num": [8],
+            "head_dim": [128],
+            "total_head_num": [8]
+        }
+    ],
+    "head_rms_norm_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "dst_dtype": "int8",
+            "num_tokens": [40],
+            "head_num": [8],
+            "head_dim": [128]
+        }
+    ],
+    "swiglu": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "hidden_size": [4096],
+            "num_tokens": [40]
+        }
+    ],
+    "rotary_embedding": [
+        {
+            "arg_type": "llm",
+            "attn_mode": "decode",
+            "dtype": "bfloat16",
+            "q_head_num.kv_head_num.head_dim": [
+                [32, 8, 128]
+            ],
+            "rope_offset.rope_dim": [
+                [0, 128]
+            ],
+            "batch_size.cache_len.q_len": [
+                [4, 1024, 1]
+            ]
+        }
+    ],
+    "flash_attention": [
+        {
+            "arg_type": "llm",
+            "attn_mode": "decode",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [32, 8, 128]
+            ],
+            "batch_size.cache_len.q_len": [
+                [4, 1024, 1]
+            ]
+        }
+    ],
+    "moe_softmax_topk": [
+        {
+            "arg_type": "llm",
+            "dtype": "float32",
+            "num_experts.topk": [
+                [64, 2]
+            ],
+            "compute_mode": [
+                "pre-softmax"
+            ],
+            "hidden_size": [4096],
+            "sp_size": [1],
+            "num_tokens": [40]
+        }
+    ],
+    "moe_gather": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "num_experts": [64],
+            "topk": [2],
+            "hidden_size": [4096],
+            "num_tokens": [40],
+            "ep_size": [1],
+            "ep_rank": [0],
+            "sp_size": [1],
+            "sp_rank": [0]
+        }
+    ]
+}

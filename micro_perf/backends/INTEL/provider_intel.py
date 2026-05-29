@@ -34,6 +34,18 @@ except:
     pass
 
 
+try:
+    import os as _os
+    import pathlib as _pathlib
+    _SYCL_EXT_SO = _pathlib.Path(__file__).resolve().parent / "ops" / "sycl_ext" / "flash_attention_sycl.so"
+    if _SYCL_EXT_SO.is_file():
+        INTEL_PROVIDER["sycl_ext"] = {
+            "sycl_ext": f"local-build ({_SYCL_EXT_SO})",
+        }
+except:
+    pass
+
+
 # https://github.com/oneapi-src/oneDNN  (locally-built under <xpu-perf>/../oneDNN/build)
 try:
     import os as _os

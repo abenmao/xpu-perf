@@ -1,0 +1,766 @@
+#include <ATen/ATen.h>
+#include <torch/extension.h>
+
+#include <cmath>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+
+#ifndef SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE
+#define SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE 0
+#endif
+
+#include "cutlass/util/packed_stride.hpp"
+#include "benchmarks/flash_attention/fmha_configuration.hpp"
+#include "cutlass/util/device_memory.h"
+#include "cutlass/util/sycl_event_manager.hpp"
+#include "sycl_common.hpp"
+
+#include <c10/xpu/XPUStream.h>
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+namespace {
+
+using torch::indexing::Slice;
+using namespace cute;
+
+int cached_sm_count(int device_id) {
+  static std::mutex mtx;
+  static std::unordered_map<int, int> cache;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto it = cache.find(device_id);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  int sm = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+  cache.emplace(device_id, sm);
+  return sm;
+}
+
+// Monotonically growing per-device workspace buffer reused across launches
+// to avoid device_memory allocation on every call.
+uint8_t* reusable_workspace(int device_id, size_t bytes) {
+  static std::mutex mtx;
+  static std::unordered_map<int, cutlass::device_memory::allocation<uint8_t>> cache;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto& slot = cache[device_id];
+  if (slot.size() < bytes) {
+    slot.reset(bytes);
+  }
+  return slot.get();
+}
+
+struct SyclTlaExecutionPlan {
+  bool use_sycl_tla = false;
+  bool is_causal = false;
+  bool is_decode = false;
+  int64_t cache_len = 0;
+  int64_t kv_new_len = 0;
+};
+
+struct ExternalFMHAParams {
+  cutlass::bfloat16_t* query = nullptr;
+  cutlass::bfloat16_t* key = nullptr;
+  cutlass::bfloat16_t* value = nullptr;
+  cutlass::bfloat16_t* key_cache = nullptr;
+  cutlass::bfloat16_t* value_cache = nullptr;
+  // Output buffer; the kernel-side cast in make_kernel_arguments picks the
+  // matching element type based on the FMHAConfig selected by the wrapper.
+  void* output = nullptr;
+  int batch = 0;
+  int num_heads_q = 0;
+  int num_heads_kv = 0;
+  int seq_len_q = 0;
+  int seq_len_kv = 0;
+  int seq_len_kv_cache = 0;
+  int head_dim = 0;
+  float softmax_scale = 0.0f;
+  bool is_causal = false;
+  int device_id = 0;
+};
+
+template <cutlass::flash_attention::FMHAMode Mode,
+          class ElementQ,
+          class ElementK,
+          class ElementV,
+          class ElementO,
+          bool Causal,
+          bool CachedKV,
+          int HeadDim>
+struct FMHAConfigSelector {
+#if SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE
+  using type = typename cutlass::flash_attention::FMHAConfigGen<
+      Mode,
+      ElementQ,
+      ElementK,
+      ElementV,
+      ElementO,
+      cutlass::layout::RowMajor,
+      cutlass::layout::ColumnMajor,
+      cutlass::layout::RowMajor,
+      cutlass::layout::RowMajor,
+      float,
+      Causal,
+      false,
+      CachedKV,
+      false,
+      false,
+      false,
+      HeadDim>::type;
+#else
+  using type = typename cutlass::flash_attention::FMHAConfigGen<
+      Mode,
+      ElementQ,
+      ElementK,
+      ElementV,
+      ElementO,
+      cutlass::layout::RowMajor,
+      cutlass::layout::ColumnMajor,
+      cutlass::layout::RowMajor,
+      cutlass::layout::RowMajor,
+      Causal,
+      false,
+      CachedKV,
+      false,
+      false,
+      HeadDim>::type;
+    #endif
+};
+// NOTE: For HeadDim=128 prefill on BMG, the sycl-tla 06 example binary uses a
+// hand-tuned tile config ShapeQK<256,32,32> with PipelineStages=2 and an
+// auto-derived SubgroupLayoutPV, which is ~36% faster than the default
+// ShapeConfig<Prefill,128> = <128,64,32> picked by FMHAConfigGen here.
+//
+// We specialize FMHAConfigSelector for HeadDim=128 prefill to directly
+// instantiate cutlass::flash_attention::FMHAConfig with 06's hand-tuned
+// tiles and SubgroupLayoutPV_ = void (auto-derive). This avoids
+// FMHAConfigGenWithTileShape, which explicitly constructs SubgroupLayoutPV
+// from the tile ratios and ends up with a slower kernel.
+#if SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE
+template <class ElementQ, class ElementK, class ElementV, class ElementO,
+          bool Causal, bool CachedKV>
+struct FMHAConfigSelector<cutlass::flash_attention::FMHAMode::Prefill,
+                          ElementQ, ElementK, ElementV, ElementO,
+                          Causal, CachedKV, 128> {
+  using type = cutlass::flash_attention::FMHAConfig<
+      ElementQ, ElementK, ElementV, ElementO,
+      cutlass::layout::RowMajor,
+      cutlass::layout::ColumnMajor,
+      cutlass::layout::RowMajor,
+      cutlass::layout::RowMajor,
+      /*ElementScale=*/float,
+      /*TileShapeQK=*/cute::Shape<cute::_256, cute::_32, cute::_32>,
+      /*TileShapePV=*/cute::Shape<cute::_256, cute::_32, cute::_32>,
+      /*TileShapeOutput=*/cute::Shape<cute::_256, cute::_128>,
+      /*SubgroupLayoutQK=*/cute::Layout<cute::Shape<cute::_16, cute::_1, cute::_1>>,
+      /*SubgroupLayoutPV_=*/void,
+      Causal,
+      /*VarLen=*/false,
+      CachedKV,
+      /*PagedKV=*/false,
+      /*Persistent=*/false,
+      /*UseScale=*/false,
+      /*PipelineStages=*/2>;
+};
+#endif
+
+template <class KernelArguments, class Enable = void>
+struct KernelArgumentScaleSetter {
+  static void apply(KernelArguments&) {}
+};
+
+template <class KernelArguments>
+struct KernelArgumentScaleSetter<
+    KernelArguments,
+    std::void_t<
+        decltype(std::declval<KernelArguments&>().scaleQ),
+        decltype(std::declval<KernelArguments&>().dScaleQ),
+        decltype(std::declval<KernelArguments&>().scaleK),
+        decltype(std::declval<KernelArguments&>().dScaleK),
+        decltype(std::declval<KernelArguments&>().scaleV),
+        decltype(std::declval<KernelArguments&>().dScaleV),
+        decltype(std::declval<KernelArguments&>().scale_k),
+        decltype(std::declval<KernelArguments&>().scale_v),
+        decltype(std::declval<KernelArguments&>().group_size)>> {
+  static void apply(KernelArguments& args) {
+    args.scaleQ = nullptr;
+    args.dScaleQ = {};
+    args.scaleK = nullptr;
+    args.dScaleK = {};
+    args.scaleV = nullptr;
+    args.dScaleV = {};
+    args.scale_k = 1.0f;
+    args.scale_v = 1.0f;
+    args.group_size = 32;
+  }
+};
+
+template <class ProblemShapeType>
+ProblemShapeType make_problem_shape(const ExternalFMHAParams& ext) {
+  ProblemShapeType problem_shape{};
+  problem_shape.batch = ext.batch;
+  problem_shape.num_heads_q = ext.num_heads_q;
+  problem_shape.num_heads_kv = ext.num_heads_kv;
+  problem_shape.seq_len_qo = ext.seq_len_q;
+  problem_shape.seq_len_kv = ext.seq_len_kv;
+  problem_shape.seq_len_kv_cache = ext.seq_len_kv_cache;
+  problem_shape.head_size_qk = ext.head_dim;
+  problem_shape.head_size_vo = ext.head_dim;
+  return problem_shape;
+}
+
+template <class FMHAKernel, class ProblemShapeType, class StrideQ, class StrideK, class StrideV, class StrideO>
+typename FMHAKernel::KernelArguments make_kernel_arguments(
+    const ExternalFMHAParams& ext,
+    const ProblemShapeType& problem_shape,
+    const StrideQ& stride_q,
+    const StrideK& stride_k,
+    const StrideV& stride_v,
+    const StrideO& stride_o,
+    const StrideK& stride_k_cache,
+    const StrideV& stride_v_cache) {
+  typename FMHAKernel::KernelArguments kernel_args{};
+  kernel_args.shape = problem_shape;
+  kernel_args.Q = ext.query;
+  kernel_args.dQ = stride_q;
+  kernel_args.K = ext.key;
+  kernel_args.dK = stride_k;
+  kernel_args.V = ext.value;
+  kernel_args.dV = stride_v;
+  kernel_args.O = static_cast<decltype(kernel_args.O)>(ext.output);
+  kernel_args.dO = stride_o;
+  KernelArgumentScaleSetter<typename FMHAKernel::KernelArguments>::apply(kernel_args);
+  kernel_args.K_cache = ext.key_cache;
+  kernel_args.dK_cache = stride_k_cache;
+  kernel_args.V_cache = ext.value_cache;
+  kernel_args.dV_cache = stride_v_cache;
+  return kernel_args;
+}
+
+template <class FMHAKernel>
+typename FMHAKernel::Arguments make_fmha_arguments(
+    const typename FMHAKernel::KernelArguments& kernel_args,
+    float softmax_scale,
+    const cutlass::KernelHardwareInfo& hw_info) {
+  return typename FMHAKernel::Arguments{
+      kernel_args,
+      {softmax_scale, nullptr, 0, nullptr},
+      {},
+      hw_info,
+  };
+}
+
+void check_attention_inputs(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value) {
+  TORCH_CHECK(query.dim() == 4, "query must be a 4D tensor [batch, heads, q_len, head_dim]");
+  TORCH_CHECK(key.dim() == 4, "key must be a 4D tensor [batch, heads, kv_len, head_dim]");
+  TORCH_CHECK(value.dim() == 4, "value must be a 4D tensor [batch, heads, kv_len, head_dim]");
+
+  TORCH_CHECK(query.device() == key.device(), "query and key must be on the same device");
+  TORCH_CHECK(query.device() == value.device(), "query and value must be on the same device");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type(), "query and key must have the same dtype");
+  TORCH_CHECK(key.scalar_type() == value.scalar_type(), "key and value must have the same dtype");
+
+  TORCH_CHECK(query.size(0) == key.size(0), "query and key batch size must match");
+  TORCH_CHECK(query.size(0) == value.size(0), "query and value batch size must match");
+  TORCH_CHECK(key.size(2) == value.size(2), "key/value sequence length must match");
+  TORCH_CHECK(key.size(3) == value.size(3), "key/value head_dim must match");
+  TORCH_CHECK(query.size(3) == key.size(3), "query/key head_dim must match");
+}
+
+torch::Tensor expand_gqa_heads(const torch::Tensor& tensor, int64_t target_heads) {
+  const int64_t source_heads = tensor.size(1);
+  TORCH_CHECK(source_heads > 0, "source head count must be positive");
+  TORCH_CHECK(
+      target_heads % source_heads == 0,
+      "enable_gqa requires query heads to be divisible by key/value heads, got query_heads=",
+      target_heads,
+      ", kv_heads=",
+      source_heads);
+
+  if (source_heads == target_heads) {
+    return tensor;
+  }
+
+  return tensor.repeat_interleave(target_heads / source_heads, 1);
+}
+
+torch::Tensor build_causal_mask(
+    int64_t q_len,
+    int64_t kv_len,
+    const c10::Device& device) {
+  auto options = torch::TensorOptions().dtype(torch::kLong).device(device);
+  auto q_idx = torch::arange(q_len, options).unsqueeze(1);
+  auto kv_idx = torch::arange(kv_len, options).unsqueeze(0);
+
+  const int64_t diagonal = kv_len - q_len;
+  return kv_idx <= (q_idx + diagonal);
+}
+
+torch::Tensor apply_attention_mask(
+    const torch::Tensor& scores,
+    const torch::Tensor& attn_mask) {
+  auto mask = attn_mask;
+  if (mask.device() != scores.device()) {
+    mask = mask.to(scores.device());
+  }
+
+  if (mask.scalar_type() == torch::kBool) {
+    const auto neg_inf = -std::numeric_limits<float>::infinity();
+    return scores.masked_fill(mask.logical_not(), neg_inf);
+  }
+
+  return scores + mask.to(scores.scalar_type());
+}
+
+torch::Tensor scaled_dot_product_attention_fallback(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    std::optional<torch::Tensor> attn_mask,
+    double dropout_p,
+    bool is_causal,
+    std::optional<double> scale) {
+  const double actual_scale = scale.has_value()
+      ? *scale
+      : 1.0 / std::sqrt(static_cast<double>(query.size(3)));
+
+  auto scores = torch::matmul(query, key.transpose(-2, -1)) * actual_scale;
+
+  if (is_causal) {
+    auto causal_mask = build_causal_mask(query.size(2), key.size(2), scores.device());
+    const auto neg_inf = -std::numeric_limits<float>::infinity();
+    scores = scores.masked_fill(causal_mask.logical_not(), neg_inf);
+  }
+
+  if (attn_mask.has_value()) {
+    scores = apply_attention_mask(scores, *attn_mask);
+  }
+
+  auto attn = torch::softmax(scores, -1);
+  if (dropout_p > 0.0) {
+    attn = torch::dropout(attn, dropout_p, true);
+  }
+
+  return torch::matmul(attn, value);
+}
+
+bool has_supported_head_dim(int64_t head_dim) {
+  return head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192;
+}
+
+torch::Tensor materialize_2d_mask(const torch::Tensor& attn_mask, int64_t q_len, int64_t kv_len) {
+  TORCH_CHECK(attn_mask.dim() >= 2, "attn_mask must have at least 2 dimensions");
+  TORCH_CHECK(attn_mask.size(-2) == q_len, "attn_mask q_len mismatch");
+  TORCH_CHECK(attn_mask.size(-1) == kv_len, "attn_mask kv_len mismatch");
+
+  for (int64_t dim = 0; dim < attn_mask.dim() - 2; ++dim) {
+    TORCH_CHECK(
+        attn_mask.size(dim) == 1,
+        "Only broadcastable singleton leading attn_mask dimensions are supported in sycl_tla path");
+  }
+
+  auto mask_2d = attn_mask;
+  while (mask_2d.dim() > 2) {
+    mask_2d = mask_2d.select(0, 0);
+  }
+  return mask_2d;
+}
+
+bool is_lower_right_causal_mask(const torch::Tensor& attn_mask, int64_t q_len, int64_t kv_len) {
+  if (attn_mask.scalar_type() != torch::kBool) {
+    return false;
+  }
+
+  torch::Tensor mask_2d;
+  try {
+    mask_2d = materialize_2d_mask(attn_mask, q_len, kv_len);
+  } catch (const c10::Error&) {
+    return false;
+  }
+
+  auto expected = build_causal_mask(q_len, kv_len, c10::Device(torch::kCPU));
+  auto host_mask = mask_2d.to(torch::kCPU);
+  return host_mask.equal(expected);
+}
+
+SyclTlaExecutionPlan build_execution_plan(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& attn_mask,
+    double dropout_p,
+    bool is_causal) {
+  SyclTlaExecutionPlan plan;
+
+  if (!query.is_xpu() || !key.is_xpu() || !value.is_xpu()) {
+    return plan;
+  }
+  if (query.scalar_type() != torch::kBFloat16 ||
+      key.scalar_type() != torch::kBFloat16 ||
+      value.scalar_type() != torch::kBFloat16) {
+    return plan;
+  }
+  if (!has_supported_head_dim(query.size(3))) {
+    return plan;
+  }
+  if (dropout_p != 0.0) {
+    return plan;
+  }
+
+  const int64_t q_len = query.size(2);
+  const int64_t kv_total_len = key.size(2);
+
+  plan.kv_new_len = kv_total_len;
+  plan.is_causal = false;
+
+  if (attn_mask.has_value()) {
+    if (!is_lower_right_causal_mask(*attn_mask, q_len, kv_total_len)) {
+      return plan;
+    }
+    TORCH_CHECK(kv_total_len >= q_len, "lower-right causal mask requires kv_len >= q_len");
+    plan.cache_len = kv_total_len - q_len;
+    plan.kv_new_len = q_len;
+    plan.is_causal = true;
+  } else if (q_len == 1) {
+    plan.cache_len = std::max<int64_t>(0, kv_total_len - 1);
+    plan.kv_new_len = kv_total_len - plan.cache_len;
+    plan.is_causal = false;
+  } else if (is_causal) {
+    if (q_len != kv_total_len) {
+      return plan;
+    }
+    plan.cache_len = 0;
+    plan.kv_new_len = kv_total_len;
+    plan.is_causal = true;
+  } else {
+    plan.cache_len = 0;
+    plan.kv_new_len = kv_total_len;
+    plan.is_causal = false;
+  }
+
+  if (plan.kv_new_len <= 0) {
+    return plan;
+  }
+
+  plan.is_decode = (q_len == 1);
+  // The current sycl-tla integration is validated for dense no-cache paths.
+  // Cached-KV variants in the target checkout need a dedicated legacy-style
+  // integration before they can replace the fallback safely.
+  plan.use_sycl_tla = (plan.cache_len == 0);
+  return plan;
+}
+
+template <class FMHAKernel>
+void launch_fmha(typename FMHAKernel::Params params, sycl::queue q) {
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+
+  dim3 const block = FMHAKernel::get_block_shape();
+  dim3 const grid = FMHAKernel::get_grid_shape(params);
+  int smem_size = FMHAKernel::SharedStorageSize;
+
+  const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+
+  compat::experimental::launch_properties launch_props {
+    syclex::work_group_scratch_size(smem_size),
+  };
+  compat::experimental::kernel_properties kernel_props {
+    syclex::sub_group_size<cute::intel::sg_size>,
+    intelex::grf_size<256>
+  };
+  compat::experimental::launch_policy policy {sycl_grid, sycl_block, launch_props, kernel_props};
+  auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, q, params);
+  EventManager::getInstance().addEvent(event);
+}
+
+template <class ElementO,
+          bool Causal,
+          bool CachedKV,
+          cutlass::flash_attention::FMHAMode Mode,
+          int HeadDim>
+cutlass::Status run_sycl_tla_bf16(const ExternalFMHAParams& ext) {
+  using ElementQ = cutlass::bfloat16_t;
+  using ElementK = cutlass::bfloat16_t;
+  using ElementV = cutlass::bfloat16_t;
+  using FMHAConfiguration = typename FMHAConfigSelector<
+      Mode,
+      ElementQ,
+      ElementK,
+      ElementV,
+      ElementO,
+      Causal,
+      CachedKV,
+      HeadDim>::type;
+  using FMHAKernel = typename FMHAConfiguration::FMHAKernel;
+  using ProblemShapeType = typename FMHAConfiguration::ProblemShapeType;
+  using StrideQ = typename FMHAKernel::StrideQ;
+  using StrideK = typename FMHAKernel::StrideK;
+  using StrideV = typename FMHAKernel::StrideV;
+  using StrideO = typename FMHAKernel::StrideO;
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = ext.device_id;
+  hw_info.sm_count = cached_sm_count(ext.device_id);
+
+  auto shape_q = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
+  auto shape_k = cute::make_shape(ext.seq_len_kv, ext.head_dim, ext.num_heads_kv, ext.batch);
+  auto shape_v = cute::make_shape(ext.head_dim, ext.seq_len_kv, ext.num_heads_kv, ext.batch);
+  auto shape_k_cache = cute::make_shape(ext.seq_len_kv_cache, ext.head_dim, ext.num_heads_kv, ext.batch);
+  auto shape_v_cache = cute::make_shape(ext.head_dim, ext.seq_len_kv_cache, ext.num_heads_kv, ext.batch);
+  auto shape_o = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
+
+  auto stride_q = cutlass::make_cute_packed_stride(StrideQ{}, shape_q);
+  auto stride_k = cutlass::make_cute_packed_stride(StrideK{}, shape_k);
+  auto stride_v = cutlass::make_cute_packed_stride(StrideV{}, shape_v);
+  auto stride_k_cache = cutlass::make_cute_packed_stride(StrideK{}, shape_k_cache);
+  auto stride_v_cache = cutlass::make_cute_packed_stride(StrideV{}, shape_v_cache);
+  auto stride_o = cutlass::make_cute_packed_stride(StrideO{}, shape_o);
+
+  auto problem_shape = make_problem_shape<ProblemShapeType>(ext);
+  auto kernel_args = make_kernel_arguments<FMHAKernel>(
+      ext,
+      problem_shape,
+      stride_q,
+      stride_k,
+      stride_v,
+      stride_o,
+      stride_k_cache,
+      stride_v_cache);
+  auto arguments = make_fmha_arguments<FMHAKernel>(kernel_args, ext.softmax_scale, hw_info);
+
+  if (!FMHAKernel::can_implement(arguments)) {
+    return cutlass::Status::kErrorInvalidProblem;
+  }
+
+  size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
+  uint8_t* workspace_ptr = workspace_size > 0
+      ? reusable_workspace(ext.device_id, workspace_size)
+      : nullptr;
+
+  auto status = FMHAKernel::initialize_workspace(arguments, workspace_ptr);
+  if (status != cutlass::Status::kSuccess) {
+    return status;
+  }
+
+  auto params = FMHAKernel::to_underlying_arguments(arguments, workspace_ptr);
+  sycl::queue& torch_q = c10::xpu::getCurrentXPUStream(ext.device_id).queue();
+  launch_fmha<FMHAKernel>(params, torch_q);
+  // Submit on PyTorch's XPU stream so that torch.xpu.synchronize() and the
+  // surrounding tensor lifetime tracking observe this launch. No host-side
+  // wait here; the caller is responsible for synchronization.
+  return cutlass::Status::kSuccess;
+}
+
+template <class ElementO, bool Causal>
+cutlass::Status dispatch_prefill_bf16(int64_t head_dim, const ExternalFMHAParams& ext) {
+  if (head_dim == 64) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 64>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 64>(ext);
+  }
+  if (head_dim == 96) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 96>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 96>(ext);
+  }
+  if (head_dim == 128) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 128>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 128>(ext);
+  }
+  if (head_dim == 192) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 192>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 192>(ext);
+  }
+  return cutlass::Status::kErrorInvalidProblem;
+}
+
+template <class ElementO, bool Causal>
+cutlass::Status dispatch_decode_bf16(int64_t head_dim, const ExternalFMHAParams& ext) {
+  if (head_dim == 64) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 64>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 64>(ext);
+  }
+  if (head_dim == 96) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 96>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 96>(ext);
+  }
+  if (head_dim == 128) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 128>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 128>(ext);
+  }
+  if (head_dim == 192) {
+    return ext.seq_len_kv_cache > 0
+        ? run_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 192>(ext)
+        : run_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 192>(ext);
+  }
+  return cutlass::Status::kErrorInvalidProblem;
+}
+
+template <class ElementO>
+cutlass::Status dispatch_sycl_tla_bf16(int64_t head_dim, const SyclTlaExecutionPlan& plan, const ExternalFMHAParams& ext) {
+  if (plan.is_decode) {
+    return plan.is_causal ? dispatch_decode_bf16<ElementO, true>(head_dim, ext) : dispatch_decode_bf16<ElementO, false>(head_dim, ext);
+  }
+  return plan.is_causal ? dispatch_prefill_bf16<ElementO, true>(head_dim, ext) : dispatch_prefill_bf16<ElementO, false>(head_dim, ext);
+}
+
+torch::Tensor scaled_dot_product_attention_sycl_tla(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const SyclTlaExecutionPlan& plan,
+    std::optional<double> scale,
+    bool fp32_output) {
+  auto query_contig = query.is_contiguous() ? query : query.contiguous();
+  auto key_contig = key.is_contiguous() ? key : key.contiguous();
+  auto value_contig = value.is_contiguous() ? value : value.contiguous();
+
+  torch::Tensor key_cache, value_cache, key_new, value_new;
+  if (plan.cache_len > 0) {
+    key_cache = key_contig.index({Slice(), Slice(), Slice(0, plan.cache_len), Slice()}).contiguous();
+    value_cache = value_contig.index({Slice(), Slice(), Slice(0, plan.cache_len), Slice()}).contiguous();
+    key_new = key_contig.index({Slice(), Slice(), Slice(plan.cache_len, plan.cache_len + plan.kv_new_len), Slice()}).contiguous();
+    value_new = value_contig.index({Slice(), Slice(), Slice(plan.cache_len, plan.cache_len + plan.kv_new_len), Slice()}).contiguous();
+  } else {
+    // No KV cache: pass full K/V as "new" and leave cache pointers null.
+    key_new = key_contig;
+    value_new = value_contig;
+  }
+
+  auto output = fp32_output
+      ? torch::empty(query_contig.sizes(), query_contig.options().dtype(torch::kFloat32))
+      : torch::empty_like(query_contig);
+
+  ExternalFMHAParams ext;
+  ext.query = reinterpret_cast<cutlass::bfloat16_t*>(query_contig.data_ptr<at::BFloat16>());
+  ext.key = reinterpret_cast<cutlass::bfloat16_t*>(key_new.data_ptr<at::BFloat16>());
+  ext.value = reinterpret_cast<cutlass::bfloat16_t*>(value_new.data_ptr<at::BFloat16>());
+  ext.key_cache = key_cache.defined() ? reinterpret_cast<cutlass::bfloat16_t*>(key_cache.data_ptr<at::BFloat16>()) : nullptr;
+  ext.value_cache = value_cache.defined() ? reinterpret_cast<cutlass::bfloat16_t*>(value_cache.data_ptr<at::BFloat16>()) : nullptr;
+  ext.output = fp32_output
+      ? static_cast<void*>(output.data_ptr<float>())
+      : static_cast<void*>(output.data_ptr<at::BFloat16>());
+  ext.batch = static_cast<int>(query_contig.size(0));
+  ext.num_heads_q = static_cast<int>(query_contig.size(1));
+  ext.num_heads_kv = static_cast<int>(key_contig.size(1));
+  ext.seq_len_q = static_cast<int>(query_contig.size(2));
+  ext.seq_len_kv = static_cast<int>(plan.kv_new_len);
+  ext.seq_len_kv_cache = static_cast<int>(plan.cache_len);
+  ext.head_dim = static_cast<int>(query_contig.size(3));
+  ext.softmax_scale = static_cast<float>(scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(query_contig.size(3))));
+  ext.is_causal = plan.is_causal;
+  ext.device_id = query_contig.get_device();
+
+  auto status = fp32_output
+      ? dispatch_sycl_tla_bf16<float>(query_contig.size(3), plan, ext)
+      : dispatch_sycl_tla_bf16<cutlass::bfloat16_t>(query_contig.size(3), plan, ext);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "sycl-tla flash attention launch failed with status code ", static_cast<int>(status));
+  return output;
+}
+
+} // namespace
+
+torch::Tensor scaled_dot_product_attention_sycl(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    std::optional<torch::Tensor> attn_mask = std::nullopt,
+    double dropout_p = 0.0,
+    bool is_causal = false,
+    std::optional<double> scale = std::nullopt,
+    bool enable_gqa = false,
+    std::optional<std::string> output_dtype = std::nullopt) {
+  check_attention_inputs(query, key, value);
+  TORCH_CHECK(dropout_p >= 0.0 && dropout_p < 1.0, "dropout_p must be in [0, 1)");
+  TORCH_CHECK(
+      !(attn_mask.has_value() && is_causal),
+      "attn_mask and is_causal cannot both be set");
+
+  if (!enable_gqa) {
+    TORCH_CHECK(
+        query.size(1) == key.size(1),
+        "query and key head count must match unless enable_gqa=True");
+    TORCH_CHECK(
+        query.size(1) == value.size(1),
+        "query and value head count must match unless enable_gqa=True");
+  } else {
+    TORCH_CHECK(
+        query.size(1) % key.size(1) == 0,
+        "enable_gqa requires query heads to be divisible by key/value heads");
+    TORCH_CHECK(
+        key.size(1) == value.size(1),
+        "key and value head count must match for enable_gqa=True");
+  }
+
+  auto plan = build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
+
+  // Paths whose FMHAConfigSelector specialization emits fp32 output via the
+  // ElementO=float epilogue (currently: prefill + head_dim==128, no KV cache).
+  // On these paths the in-kernel fp32->bf16 conversion is avoided, matching
+  // the sycl-tla 06 binary's throughput (~8% faster).
+  const bool fp32_output_supported =
+      plan.use_sycl_tla && !plan.is_decode && query.size(3) == 128;
+
+  bool fp32_output = fp32_output_supported;  // default: fp32 wherever supported
+  if (output_dtype.has_value()) {
+    const auto& d = *output_dtype;
+    if (d == "float32" || d == "fp32") {
+      TORCH_CHECK(fp32_output_supported,
+                  "output_dtype='float32' is currently only supported for prefill with head_dim=128 on the sycl-tla path");
+      fp32_output = true;
+    } else if (d == "bfloat16" || d == "bf16") {
+      fp32_output = false;
+    } else {
+      TORCH_CHECK(false, "sycl_ext flash_attention output_dtype must be one of {bfloat16, float32}, got: ", d);
+    }
+  }
+
+  if (plan.use_sycl_tla) {
+    return scaled_dot_product_attention_sycl_tla(query, key, value, plan, scale, fp32_output);
+  }
+
+  if (enable_gqa) {
+    key = expand_gqa_heads(key, query.size(1));
+    value = expand_gqa_heads(value, query.size(1));
+  }
+
+  return scaled_dot_product_attention_fallback(
+      query,
+      key,
+      value,
+      attn_mask,
+      dropout_p,
+      is_causal,
+      scale);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def(
+      "scaled_dot_product_attention",
+      &scaled_dot_product_attention_sycl,
+      pybind11::arg("query"),
+      pybind11::arg("key"),
+      pybind11::arg("value"),
+      pybind11::arg("attn_mask") = pybind11::none(),
+      pybind11::arg("dropout_p") = 0.0,
+      pybind11::arg("is_causal") = false,
+      pybind11::arg("scale") = pybind11::none(),
+      pybind11::arg("enable_gqa") = false,
+      pybind11::arg("output_dtype") = pybind11::none(),
+      "SDPA-compatible flash attention exposed from sycl_ext with a sycl-tla-backed bf16 XPU path and ATen fallback.");
+}

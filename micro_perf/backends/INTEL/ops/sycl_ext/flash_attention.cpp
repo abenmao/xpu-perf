@@ -79,6 +79,10 @@ struct ExternalFMHAParams {
   int seq_len_q = 0;
   int seq_len_kv = 0;
   int seq_len_kv_cache = 0;
+  // Total kv length of the parent K/V tensor backing key/value/key_cache/
+  // value_cache. Used to derive head/batch strides without forcing a
+  // .contiguous() copy on the cached path. When 0, fall back to seq_len_kv.
+  int parent_kv_total = 0;
   int head_dim = 0;
   float softmax_scale = 0.0f;
   bool is_causal = false;
@@ -451,11 +455,19 @@ SyclTlaExecutionPlan build_execution_plan(
     return plan;
   }
 
-  plan.is_decode = (q_len == 1);
-  // The current sycl-tla integration is validated for dense no-cache paths.
-  // Cached-KV variants in the target checkout need a dedicated legacy-style
-  // integration before they can replace the fallback safely.
-  plan.use_sycl_tla = (plan.cache_len == 0);
+  // Route through the Decode kernel whenever the q dimension is small. The
+  // Decode kernel's q-tile is 1 (loops over q rows) with a large kv-tile (512),
+  // which is the right shape for short-q + large-cache cases. The Prefill
+  // kernel's 256-row q-tile wastes most of its q lanes when q_len is tiny
+  // (e.g. q=4 over a 10k-row cache is ~64x over-compute in the q dim). The
+  // threshold of 16 is conservative: below it, Decode reliably wins on BMG
+  // for the head_dim=128 shapes we benchmark; above it, Prefill's wider tile
+  // amortizes K/V loads better.
+  plan.is_decode = (q_len <= 16);
+  // The CachedKV dispatch path is wired in run_sycl_tla_bf16 (K_cache/V_cache
+  // kernel args, dedicated FMHAConfigSelector instantiations). Enable it for
+  // both prefill and decode shapes.
+  plan.use_sycl_tla = true;
   return plan;
 }
 
@@ -519,11 +531,21 @@ cutlass::Status run_sycl_tla_bf16(const ExternalFMHAParams& ext) {
   auto shape_v_cache = cute::make_shape(ext.head_dim, ext.seq_len_kv_cache, ext.num_heads_kv, ext.batch);
   auto shape_o = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
 
+  // K/V layouts use the parent buffer's kv-total dim to compute head/batch
+  // strides when present, so the wrapper can pass pointer offsets into a
+  // shared [b, h, kv_total, d] tensor without making a .contiguous() copy of
+  // each slice. parent_kv_total == 0 means "data is packed at seq_len_kv".
+  const int parent_kv_total = ext.parent_kv_total > 0 ? ext.parent_kv_total : ext.seq_len_kv;
+  auto shape_k_stride = cute::make_shape(parent_kv_total, ext.head_dim, ext.num_heads_kv, ext.batch);
+  auto shape_v_stride = cute::make_shape(ext.head_dim, parent_kv_total, ext.num_heads_kv, ext.batch);
+
   auto stride_q = cutlass::make_cute_packed_stride(StrideQ{}, shape_q);
-  auto stride_k = cutlass::make_cute_packed_stride(StrideK{}, shape_k);
-  auto stride_v = cutlass::make_cute_packed_stride(StrideV{}, shape_v);
-  auto stride_k_cache = cutlass::make_cute_packed_stride(StrideK{}, shape_k_cache);
-  auto stride_v_cache = cutlass::make_cute_packed_stride(StrideV{}, shape_v_cache);
+  auto stride_k = cutlass::make_cute_packed_stride(StrideK{}, shape_k_stride);
+  auto stride_v = cutlass::make_cute_packed_stride(StrideV{}, shape_v_stride);
+  // K_cache / V_cache share the same parent buffer (and thus the same head/
+  // batch strides) as K / V. The kernel reads only seq_len_kv_cache rows.
+  auto stride_k_cache = stride_k;
+  auto stride_v_cache = stride_v;
   auto stride_o = cutlass::make_cute_packed_stride(StrideO{}, shape_o);
 
   auto problem_shape = make_problem_shape<ProblemShapeType>(ext);
@@ -630,16 +652,28 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
   auto key_contig = key.is_contiguous() ? key : key.contiguous();
   auto value_contig = value.is_contiguous() ? value : value.contiguous();
 
-  torch::Tensor key_cache, value_cache, key_new, value_new;
+  // For the KV-cache path, K/V live in the same parent buffer
+  // [batch, num_heads_kv, parent_kv_total, head_dim] (contiguous). We avoid
+  // a costly .contiguous() copy of the cached slice (which on long-context
+  // workloads is hundreds of MB per call) by passing pointer offsets and
+  // setting parent_kv_total so run_sycl_tla_bf16 uses parent strides for
+  // head/batch dims while still reading only seq_len_kv_cache / kv_new_len
+  // rows from the kv dim.
+  const int64_t parent_kv_total = key_contig.size(2);
+  const int64_t hd = query_contig.size(3);
+  cutlass::bfloat16_t* key_base = reinterpret_cast<cutlass::bfloat16_t*>(key_contig.data_ptr<at::BFloat16>());
+  cutlass::bfloat16_t* value_base = reinterpret_cast<cutlass::bfloat16_t*>(value_contig.data_ptr<at::BFloat16>());
+  cutlass::bfloat16_t* key_new_ptr = key_base;
+  cutlass::bfloat16_t* value_new_ptr = value_base;
+  cutlass::bfloat16_t* key_cache_ptr = nullptr;
+  cutlass::bfloat16_t* value_cache_ptr = nullptr;
   if (plan.cache_len > 0) {
-    key_cache = key_contig.index({Slice(), Slice(), Slice(0, plan.cache_len), Slice()}).contiguous();
-    value_cache = value_contig.index({Slice(), Slice(), Slice(0, plan.cache_len), Slice()}).contiguous();
-    key_new = key_contig.index({Slice(), Slice(), Slice(plan.cache_len, plan.cache_len + plan.kv_new_len), Slice()}).contiguous();
-    value_new = value_contig.index({Slice(), Slice(), Slice(plan.cache_len, plan.cache_len + plan.kv_new_len), Slice()}).contiguous();
-  } else {
-    // No KV cache: pass full K/V as "new" and leave cache pointers null.
-    key_new = key_contig;
-    value_new = value_contig;
+    key_cache_ptr = key_base;
+    value_cache_ptr = value_base;
+    // K_new / V_new start at kv-offset = cache_len within the parent buffer
+    // (PyTorch layout is [b, h, kv, d] contiguous, so the kv-stride is hd).
+    key_new_ptr = key_base + plan.cache_len * hd;
+    value_new_ptr = value_base + plan.cache_len * hd;
   }
 
   auto output = fp32_output
@@ -648,10 +682,10 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
 
   ExternalFMHAParams ext;
   ext.query = reinterpret_cast<cutlass::bfloat16_t*>(query_contig.data_ptr<at::BFloat16>());
-  ext.key = reinterpret_cast<cutlass::bfloat16_t*>(key_new.data_ptr<at::BFloat16>());
-  ext.value = reinterpret_cast<cutlass::bfloat16_t*>(value_new.data_ptr<at::BFloat16>());
-  ext.key_cache = key_cache.defined() ? reinterpret_cast<cutlass::bfloat16_t*>(key_cache.data_ptr<at::BFloat16>()) : nullptr;
-  ext.value_cache = value_cache.defined() ? reinterpret_cast<cutlass::bfloat16_t*>(value_cache.data_ptr<at::BFloat16>()) : nullptr;
+  ext.key = key_new_ptr;
+  ext.value = value_new_ptr;
+  ext.key_cache = key_cache_ptr;
+  ext.value_cache = value_cache_ptr;
   ext.output = fp32_output
       ? static_cast<void*>(output.data_ptr<float>())
       : static_cast<void*>(output.data_ptr<at::BFloat16>());
@@ -661,7 +695,8 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
   ext.seq_len_q = static_cast<int>(query_contig.size(2));
   ext.seq_len_kv = static_cast<int>(plan.kv_new_len);
   ext.seq_len_kv_cache = static_cast<int>(plan.cache_len);
-  ext.head_dim = static_cast<int>(query_contig.size(3));
+  ext.parent_kv_total = static_cast<int>(parent_kv_total);
+  ext.head_dim = static_cast<int>(hd);
   ext.softmax_scale = static_cast<float>(scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(query_contig.size(3))));
   ext.is_causal = plan.is_causal;
   ext.device_id = query_contig.get_device();

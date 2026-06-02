@@ -127,7 +127,6 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
 Notes:
 
 - `build.sh` now auto-selects `python3` first, and falls back to `python` if needed.
-- It auto-detects the old/new sycl-tla FMHA template ABI and passes `-DSYCL_TLA_FMHA_HAS_SCALE_TEMPLATE=...` accordingly.
 - Torch include and library paths are resolved from the active Python environment.
 
 ### Method 2: Build only flash attention

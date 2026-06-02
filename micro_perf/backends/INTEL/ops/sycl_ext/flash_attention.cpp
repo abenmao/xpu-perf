@@ -11,10 +11,6 @@
 #include <unordered_map>
 #include <utility>
 
-#ifndef SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE
-#define SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE 0
-#endif
-
 #include "cutlass/util/packed_stride.hpp"
 #include "benchmarks/flash_attention/fmha_configuration.hpp"
 #include "cutlass/util/device_memory.h"
@@ -98,7 +94,6 @@ template <cutlass::flash_attention::FMHAMode Mode,
           bool CachedKV,
           int HeadDim>
 struct FMHAConfigSelector {
-#if SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE
   using type = typename cutlass::flash_attention::FMHAConfigGen<
       Mode,
       ElementQ,
@@ -117,24 +112,6 @@ struct FMHAConfigSelector {
       false,
       false,
       HeadDim>::type;
-#else
-  using type = typename cutlass::flash_attention::FMHAConfigGen<
-      Mode,
-      ElementQ,
-      ElementK,
-      ElementV,
-      ElementO,
-      cutlass::layout::RowMajor,
-      cutlass::layout::ColumnMajor,
-      cutlass::layout::RowMajor,
-      cutlass::layout::RowMajor,
-      Causal,
-      false,
-      CachedKV,
-      false,
-      false,
-      HeadDim>::type;
-    #endif
 };
 // NOTE: For HeadDim=128 prefill on BMG, the sycl-tla 06 example binary uses a
 // hand-tuned tile config ShapeQK<256,32,32> with PipelineStages=2 and an
@@ -146,7 +123,6 @@ struct FMHAConfigSelector {
 // tiles and SubgroupLayoutPV_ = void (auto-derive). This avoids
 // FMHAConfigGenWithTileShape, which explicitly constructs SubgroupLayoutPV
 // from the tile ratios and ends up with a slower kernel.
-#if SYCL_TLA_FMHA_HAS_SCALE_TEMPLATE
 template <class ElementQ, class ElementK, class ElementV, class ElementO,
           bool Causal, bool CachedKV>
 struct FMHAConfigSelector<cutlass::flash_attention::FMHAMode::Prefill,
@@ -172,7 +148,6 @@ struct FMHAConfigSelector<cutlass::flash_attention::FMHAMode::Prefill,
       /*UseScale=*/false,
       /*PipelineStages=*/2>;
 };
-#endif
 
 template <class KernelArguments, class Enable = void>
 struct KernelArgumentScaleSetter {

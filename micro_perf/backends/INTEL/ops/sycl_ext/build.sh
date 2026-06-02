@@ -55,12 +55,6 @@ SYCL_TLA_RUNTIME_PATHS=(-Wl,-rpath,/lib64/stubs -Wl,-rpath,"$MKLROOT/lib" -Wl,-r
 BMG_09_LINK_FLAGS=(-Xs "-options \"-igc_opts 'VectorAliasBBThreshold=10000'\"")
 BMG_10_LINK_FLAGS=(-Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
 
-SYCL_TLA_FMHA_MACRO=0
-if grep -q "ElementScale" "$SYCL_TLA_ROOT/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"; then
-    SYCL_TLA_FMHA_MACRO=1
-fi
-SYCL_TLA_COMPILE_FLAGS="$SYCL_TLA_COMPILE_FLAGS -DSYCL_TLA_FMHA_HAS_SCALE_TEMPLATE=$SYCL_TLA_FMHA_MACRO"
-
 echo "Building store_kv_cache SYCL extension..."
 icpx -fsycl -shared -fPIC -O2 -std=c++17 \
     -DTORCH_EXTENSION_NAME=store_kv_cache_sycl \

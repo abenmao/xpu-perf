@@ -50,12 +50,6 @@ SYCL_TLA_LIB_DIRS="-L$MKLROOT/lib -L$TBBROOT/lib/intel64/gcc4.8"
 SYCL_TLA_LINK_LIBS="$MKLROOT/lib/libmkl_intel_thread.so $CMPLR_ROOT/lib/libiomp5.so $MKLROOT/lib/libmkl_intel_ilp64.so $MKLROOT/lib/libmkl_core.so -fsycl $MKLROOT/lib/libmkl_sycl_blas.so $MKLROOT/lib/libmkl_tbb_thread.so $SYCL_TLA_LIB_DIRS -ltbb -lsycl -lOpenCL -lm -ldl -lpthread"
 SYCL_TLA_RUNTIME_PATHS=(-Wl,-rpath,/lib64/stubs -Wl,-rpath,"$MKLROOT/lib" -Wl,-rpath,"$TBBROOT/lib/intel64/gcc4.8")
 
-SYCL_TLA_FMHA_MACRO=0
-if grep -q "ElementScale" "$SYCL_TLA_ROOT/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"; then
-    SYCL_TLA_FMHA_MACRO=1
-fi
-SYCL_TLA_COMPILE_FLAGS="$SYCL_TLA_COMPILE_FLAGS -DSYCL_TLA_FMHA_HAS_SCALE_TEMPLATE=$SYCL_TLA_FMHA_MACRO"
-
 echo "Building flash_attention SYCL extension..."
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=flash_attention_sycl \

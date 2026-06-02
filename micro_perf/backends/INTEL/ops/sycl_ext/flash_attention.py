@@ -63,6 +63,12 @@ def scaled_dot_product_attention(
     scale=None,
     enable_gqa=False,
     output_dtype=None,
+    output=None,
+    plan_cache_len=None,
+    plan_kv_new_len=None,
+    plan_is_causal=None,
+    plan_is_decode=None,
+    plan_use_sycl_tla=None,
 ):
     return _get_extension().scaled_dot_product_attention(
         query,
@@ -74,4 +80,50 @@ def scaled_dot_product_attention(
         scale,
         enable_gqa,
         output_dtype,
+        output,
+        plan_cache_len,
+        plan_kv_new_len,
+        plan_is_causal,
+        plan_is_decode,
+        plan_use_sycl_tla,
     )
+
+
+def prepare_scaled_dot_product_attention(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+    output_dtype=None,
+    output=None,
+    plan_cache_len=None,
+    plan_kv_new_len=None,
+    plan_is_causal=None,
+    plan_is_decode=None,
+    plan_use_sycl_tla=None,
+):
+    return _get_extension().prepare_scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa,
+        output_dtype,
+        output,
+        plan_cache_len,
+        plan_kv_new_len,
+        plan_is_causal,
+        plan_is_decode,
+        plan_use_sycl_tla,
+    )
+
+
+def run_prepared_scaled_dot_product_attention(prepared):
+    return _get_extension().run_prepared_scaled_dot_product_attention(prepared)

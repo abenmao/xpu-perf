@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "cutlass/util/packed_stride.hpp"
 #include "benchmarks/flash_attention/fmha_configuration.hpp"
@@ -59,6 +61,92 @@ struct SyclTlaExecutionPlan {
   int64_t cache_len = 0;
   int64_t kv_new_len = 0;
 };
+
+bool has_supported_head_dim(int64_t head_dim);
+
+bool is_sycl_tla_candidate(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    double dropout_p) {
+  if (!query.is_xpu() || !key.is_xpu() || !value.is_xpu()) {
+    return false;
+  }
+  if (query.scalar_type() != torch::kBFloat16 ||
+      key.scalar_type() != torch::kBFloat16 ||
+      value.scalar_type() != torch::kBFloat16) {
+    return false;
+  }
+  if (!has_supported_head_dim(query.size(3))) {
+    return false;
+  }
+  if (dropout_p != 0.0) {
+    return false;
+  }
+  return true;
+}
+
+bool has_execution_plan_override(
+    const std::optional<int64_t>& plan_cache_len,
+    const std::optional<int64_t>& plan_kv_new_len,
+    const std::optional<bool>& plan_is_causal,
+    const std::optional<bool>& plan_is_decode,
+    const std::optional<bool>& plan_use_sycl_tla) {
+  return plan_cache_len.has_value() ||
+      plan_kv_new_len.has_value() ||
+      plan_is_causal.has_value() ||
+      plan_is_decode.has_value() ||
+      plan_use_sycl_tla.has_value();
+}
+
+std::optional<SyclTlaExecutionPlan> build_execution_plan_override(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    double dropout_p,
+    const std::optional<int64_t>& plan_cache_len,
+    const std::optional<int64_t>& plan_kv_new_len,
+    const std::optional<bool>& plan_is_causal,
+    const std::optional<bool>& plan_is_decode,
+    const std::optional<bool>& plan_use_sycl_tla) {
+  if (!has_execution_plan_override(
+          plan_cache_len,
+          plan_kv_new_len,
+          plan_is_causal,
+          plan_is_decode,
+          plan_use_sycl_tla)) {
+    return std::nullopt;
+  }
+
+  const int64_t q_len = query.size(2);
+  const int64_t kv_total_len = key.size(2);
+
+  SyclTlaExecutionPlan plan;
+  plan.cache_len = plan_cache_len.value_or(0);
+  plan.kv_new_len = plan_kv_new_len.value_or(kv_total_len - plan.cache_len);
+  plan.is_causal = plan_is_causal.value_or(false);
+  plan.is_decode = plan_is_decode.value_or(q_len <= 16);
+  plan.use_sycl_tla = plan_use_sycl_tla.value_or(false);
+
+  TORCH_CHECK(plan.cache_len >= 0, "plan_cache_len must be non-negative");
+  TORCH_CHECK(plan.kv_new_len > 0, "plan_kv_new_len must be positive");
+  TORCH_CHECK(
+      plan.cache_len + plan.kv_new_len <= kv_total_len,
+      "execution plan expects cache_len + kv_new_len <= total kv length, got cache_len=",
+      plan.cache_len,
+      ", kv_new_len=",
+      plan.kv_new_len,
+      ", kv_total_len=",
+      kv_total_len);
+
+  if (plan.use_sycl_tla) {
+    TORCH_CHECK(
+        is_sycl_tla_candidate(query, key, value, dropout_p),
+        "provided execution plan requests sycl-tla for unsupported input configuration");
+  }
+
+  return plan;
+}
 
 struct ExternalFMHAParams {
   cutlass::bfloat16_t* query = nullptr;
@@ -380,18 +468,7 @@ SyclTlaExecutionPlan build_execution_plan(
     bool is_causal) {
   SyclTlaExecutionPlan plan;
 
-  if (!query.is_xpu() || !key.is_xpu() || !value.is_xpu()) {
-    return plan;
-  }
-  if (query.scalar_type() != torch::kBFloat16 ||
-      key.scalar_type() != torch::kBFloat16 ||
-      value.scalar_type() != torch::kBFloat16) {
-    return plan;
-  }
-  if (!has_supported_head_dim(query.size(3))) {
-    return plan;
-  }
-  if (dropout_p != 0.0) {
+  if (!is_sycl_tla_candidate(query, key, value, dropout_p)) {
     return plan;
   }
 
@@ -446,6 +523,26 @@ SyclTlaExecutionPlan build_execution_plan(
   return plan;
 }
 
+torch::Tensor prepare_output_tensor(
+    const torch::Tensor& query,
+    const std::optional<torch::Tensor>& output,
+    bool fp32_output) {
+  const auto expected_dtype = fp32_output ? torch::kFloat32 : query.scalar_type();
+
+  if (output.has_value()) {
+    auto out = *output;
+    TORCH_CHECK(out.device() == query.device(), "output must be on the same device as query");
+    TORCH_CHECK(out.scalar_type() == expected_dtype, "output dtype mismatch");
+    TORCH_CHECK(out.sizes().vec() == query.sizes().vec(), "output shape mismatch");
+    TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+    return out;
+  }
+
+  return fp32_output
+      ? torch::empty(query.sizes(), query.options().dtype(torch::kFloat32))
+      : torch::empty_like(query);
+}
+
 template <class FMHAKernel>
 void launch_fmha(typename FMHAKernel::Params params, sycl::queue q) {
   namespace syclex = sycl::ext::oneapi::experimental;
@@ -463,11 +560,136 @@ void launch_fmha(typename FMHAKernel::Params params, sycl::queue q) {
   };
   compat::experimental::kernel_properties kernel_props {
     syclex::sub_group_size<cute::intel::sg_size>,
+#if (SYCL_INTEL_TARGET == 35)
+    intelex::grf_size<512>
+#else
     intelex::grf_size<256>
+#endif
   };
   compat::experimental::launch_policy policy {sycl_grid, sycl_block, launch_props, kernel_props};
   auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, q, params);
   EventManager::getInstance().addEvent(event);
+}
+
+struct PreparedScaledDotProductAttention {
+  virtual ~PreparedScaledDotProductAttention() = default;
+  virtual void run(sycl::queue& q) = 0;
+  virtual torch::Tensor output() const = 0;
+  virtual int device_id() const = 0;
+};
+
+template <class FMHAKernel>
+struct PreparedScaledDotProductAttentionImpl : PreparedScaledDotProductAttention {
+  PreparedScaledDotProductAttentionImpl(
+      const typename FMHAKernel::Arguments& arguments,
+      std::vector<torch::Tensor> keepalive,
+      torch::Tensor output_tensor,
+      int device_id)
+      : keepalive_(std::move(keepalive)),
+        output_tensor_(std::move(output_tensor)),
+        device_id_(device_id) {
+    const size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
+    if (workspace_size > 0) {
+      workspace_.reset(workspace_size);
+    }
+    uint8_t* workspace_ptr = workspace_size > 0 ? workspace_.get() : nullptr;
+
+    auto status = FMHAKernel::initialize_workspace(arguments, workspace_ptr);
+    TORCH_CHECK(
+        status == cutlass::Status::kSuccess,
+        "sycl-tla flash attention workspace initialization failed with status code ",
+        static_cast<int>(status));
+
+    params_.emplace(FMHAKernel::to_underlying_arguments(arguments, workspace_ptr));
+  }
+
+  void run(sycl::queue& q) override {
+    TORCH_CHECK(params_.has_value(), "prepared flash attention params not initialized");
+    launch_fmha<FMHAKernel>(*params_, q);
+  }
+
+  torch::Tensor output() const override {
+    return output_tensor_;
+  }
+
+  int device_id() const override {
+    return device_id_;
+  }
+
+ private:
+  std::optional<typename FMHAKernel::Params> params_;
+  cutlass::device_memory::allocation<uint8_t> workspace_;
+  std::vector<torch::Tensor> keepalive_;
+  torch::Tensor output_tensor_;
+  int device_id_ = 0;
+};
+
+template <class ElementO,
+          bool Causal,
+          bool CachedKV,
+          cutlass::flash_attention::FMHAMode Mode,
+          int HeadDim>
+std::shared_ptr<PreparedScaledDotProductAttention> prepare_sycl_tla_bf16(
+    const ExternalFMHAParams& ext,
+    const torch::Tensor& output_tensor,
+    std::vector<torch::Tensor> keepalive) {
+  using ElementQ = cutlass::bfloat16_t;
+  using ElementK = cutlass::bfloat16_t;
+  using ElementV = cutlass::bfloat16_t;
+  using FMHAConfiguration = typename FMHAConfigSelector<
+      Mode,
+      ElementQ,
+      ElementK,
+      ElementV,
+      ElementO,
+      Causal,
+      CachedKV,
+      HeadDim>::type;
+  using FMHAKernel = typename FMHAConfiguration::FMHAKernel;
+  using ProblemShapeType = typename FMHAConfiguration::ProblemShapeType;
+  using StrideQ = typename FMHAKernel::StrideQ;
+  using StrideK = typename FMHAKernel::StrideK;
+  using StrideV = typename FMHAKernel::StrideV;
+  using StrideO = typename FMHAKernel::StrideO;
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = ext.device_id;
+  hw_info.sm_count = cached_sm_count(ext.device_id);
+
+  auto shape_q = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
+  const int parent_kv_total = ext.parent_kv_total > 0 ? ext.parent_kv_total : ext.seq_len_kv;
+  auto shape_k_stride = cute::make_shape(parent_kv_total, ext.head_dim, ext.num_heads_kv, ext.batch);
+  auto shape_v_stride = cute::make_shape(ext.head_dim, parent_kv_total, ext.num_heads_kv, ext.batch);
+  auto shape_o = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
+
+  auto stride_q = cutlass::make_cute_packed_stride(StrideQ{}, shape_q);
+  auto stride_k = cutlass::make_cute_packed_stride(StrideK{}, shape_k_stride);
+  auto stride_v = cutlass::make_cute_packed_stride(StrideV{}, shape_v_stride);
+  auto stride_k_cache = stride_k;
+  auto stride_v_cache = stride_v;
+  auto stride_o = cutlass::make_cute_packed_stride(StrideO{}, shape_o);
+
+  auto problem_shape = make_problem_shape<ProblemShapeType>(ext);
+  auto kernel_args = make_kernel_arguments<FMHAKernel>(
+      ext,
+      problem_shape,
+      stride_q,
+      stride_k,
+      stride_v,
+      stride_o,
+      stride_k_cache,
+      stride_v_cache);
+  auto arguments = make_fmha_arguments<FMHAKernel>(kernel_args, ext.softmax_scale, hw_info);
+
+  TORCH_CHECK(
+      FMHAKernel::can_implement(arguments),
+      "sycl-tla flash attention cannot implement the requested problem");
+
+  return std::make_shared<PreparedScaledDotProductAttentionImpl<FMHAKernel>>(
+      arguments,
+      std::move(keepalive),
+      output_tensor,
+      ext.device_id);
 }
 
 template <class ElementO,
@@ -584,6 +806,36 @@ cutlass::Status dispatch_prefill_bf16(int64_t head_dim, const ExternalFMHAParams
 }
 
 template <class ElementO, bool Causal>
+std::shared_ptr<PreparedScaledDotProductAttention> dispatch_prepare_prefill_bf16(
+    int64_t head_dim,
+    const ExternalFMHAParams& ext,
+    const torch::Tensor& output_tensor,
+    std::vector<torch::Tensor> keepalive) {
+  if (head_dim == 64) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 64>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 64>(ext, output_tensor, std::move(keepalive));
+  }
+  if (head_dim == 96) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 96>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 96>(ext, output_tensor, std::move(keepalive));
+  }
+  if (head_dim == 128) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 128>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 128>(ext, output_tensor, std::move(keepalive));
+  }
+  if (head_dim == 192) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Prefill, 192>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Prefill, 192>(ext, output_tensor, std::move(keepalive));
+  }
+  TORCH_CHECK(false, "unsupported head_dim for prefill prepare path");
+  return nullptr;
+}
+
+template <class ElementO, bool Causal>
 cutlass::Status dispatch_decode_bf16(int64_t head_dim, const ExternalFMHAParams& ext) {
   if (head_dim == 64) {
     return ext.seq_len_kv_cache > 0
@@ -608,6 +860,36 @@ cutlass::Status dispatch_decode_bf16(int64_t head_dim, const ExternalFMHAParams&
   return cutlass::Status::kErrorInvalidProblem;
 }
 
+template <class ElementO, bool Causal>
+std::shared_ptr<PreparedScaledDotProductAttention> dispatch_prepare_decode_bf16(
+    int64_t head_dim,
+    const ExternalFMHAParams& ext,
+    const torch::Tensor& output_tensor,
+    std::vector<torch::Tensor> keepalive) {
+  if (head_dim == 64) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 64>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 64>(ext, output_tensor, std::move(keepalive));
+  }
+  if (head_dim == 96) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 96>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 96>(ext, output_tensor, std::move(keepalive));
+  }
+  if (head_dim == 128) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 128>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 128>(ext, output_tensor, std::move(keepalive));
+  }
+  if (head_dim == 192) {
+    return ext.seq_len_kv_cache > 0
+        ? prepare_sycl_tla_bf16<ElementO, Causal, true, cutlass::flash_attention::FMHAMode::Decode, 192>(ext, output_tensor, std::move(keepalive))
+        : prepare_sycl_tla_bf16<ElementO, Causal, false, cutlass::flash_attention::FMHAMode::Decode, 192>(ext, output_tensor, std::move(keepalive));
+  }
+  TORCH_CHECK(false, "unsupported head_dim for decode prepare path");
+  return nullptr;
+}
+
 template <class ElementO>
 cutlass::Status dispatch_sycl_tla_bf16(int64_t head_dim, const SyclTlaExecutionPlan& plan, const ExternalFMHAParams& ext) {
   if (plan.is_decode) {
@@ -616,13 +898,31 @@ cutlass::Status dispatch_sycl_tla_bf16(int64_t head_dim, const SyclTlaExecutionP
   return plan.is_causal ? dispatch_prefill_bf16<ElementO, true>(head_dim, ext) : dispatch_prefill_bf16<ElementO, false>(head_dim, ext);
 }
 
+template <class ElementO>
+std::shared_ptr<PreparedScaledDotProductAttention> dispatch_prepare_sycl_tla_bf16(
+    int64_t head_dim,
+    const SyclTlaExecutionPlan& plan,
+    const ExternalFMHAParams& ext,
+    const torch::Tensor& output_tensor,
+    std::vector<torch::Tensor> keepalive) {
+  if (plan.is_decode) {
+    return plan.is_causal
+        ? dispatch_prepare_decode_bf16<ElementO, true>(head_dim, ext, output_tensor, std::move(keepalive))
+        : dispatch_prepare_decode_bf16<ElementO, false>(head_dim, ext, output_tensor, std::move(keepalive));
+  }
+  return plan.is_causal
+      ? dispatch_prepare_prefill_bf16<ElementO, true>(head_dim, ext, output_tensor, std::move(keepalive))
+      : dispatch_prepare_prefill_bf16<ElementO, false>(head_dim, ext, output_tensor, std::move(keepalive));
+}
+
 torch::Tensor scaled_dot_product_attention_sycl_tla(
     const torch::Tensor& query,
     const torch::Tensor& key,
     const torch::Tensor& value,
     const SyclTlaExecutionPlan& plan,
     std::optional<double> scale,
-    bool fp32_output) {
+  bool fp32_output,
+  const std::optional<torch::Tensor>& output) {
   auto query_contig = query.is_contiguous() ? query : query.contiguous();
   auto key_contig = key.is_contiguous() ? key : key.contiguous();
   auto value_contig = value.is_contiguous() ? value : value.contiguous();
@@ -651,9 +951,7 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
     value_new_ptr = value_base + plan.cache_len * hd;
   }
 
-  auto output = fp32_output
-      ? torch::empty(query_contig.sizes(), query_contig.options().dtype(torch::kFloat32))
-      : torch::empty_like(query_contig);
+    auto output_tensor = prepare_output_tensor(query_contig, output, fp32_output);
 
   ExternalFMHAParams ext;
   ext.query = reinterpret_cast<cutlass::bfloat16_t*>(query_contig.data_ptr<at::BFloat16>());
@@ -661,9 +959,9 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
   ext.value = value_new_ptr;
   ext.key_cache = key_cache_ptr;
   ext.value_cache = value_cache_ptr;
-  ext.output = fp32_output
-      ? static_cast<void*>(output.data_ptr<float>())
-      : static_cast<void*>(output.data_ptr<at::BFloat16>());
+    ext.output = fp32_output
+      ? static_cast<void*>(output_tensor.data_ptr<float>())
+      : static_cast<void*>(output_tensor.data_ptr<at::BFloat16>());
   ext.batch = static_cast<int>(query_contig.size(0));
   ext.num_heads_q = static_cast<int>(query_contig.size(1));
   ext.num_heads_kv = static_cast<int>(key_contig.size(1));
@@ -680,12 +978,75 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
       ? dispatch_sycl_tla_bf16<float>(query_contig.size(3), plan, ext)
       : dispatch_sycl_tla_bf16<cutlass::bfloat16_t>(query_contig.size(3), plan, ext);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "sycl-tla flash attention launch failed with status code ", static_cast<int>(status));
-  return output;
+  return output_tensor;
+}
+
+std::shared_ptr<PreparedScaledDotProductAttention> prepare_scaled_dot_product_attention_sycl_tla(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const SyclTlaExecutionPlan& plan,
+    std::optional<double> scale,
+    bool fp32_output,
+    const std::optional<torch::Tensor>& output) {
+  auto query_contig = query.is_contiguous() ? query : query.contiguous();
+  auto key_contig = key.is_contiguous() ? key : key.contiguous();
+  auto value_contig = value.is_contiguous() ? value : value.contiguous();
+
+  const int64_t parent_kv_total = key_contig.size(2);
+  const int64_t hd = query_contig.size(3);
+  cutlass::bfloat16_t* key_base = reinterpret_cast<cutlass::bfloat16_t*>(key_contig.data_ptr<at::BFloat16>());
+  cutlass::bfloat16_t* value_base = reinterpret_cast<cutlass::bfloat16_t*>(value_contig.data_ptr<at::BFloat16>());
+  cutlass::bfloat16_t* key_new_ptr = key_base;
+  cutlass::bfloat16_t* value_new_ptr = value_base;
+  cutlass::bfloat16_t* key_cache_ptr = nullptr;
+  cutlass::bfloat16_t* value_cache_ptr = nullptr;
+  if (plan.cache_len > 0) {
+    key_cache_ptr = key_base;
+    value_cache_ptr = value_base;
+    key_new_ptr = key_base + plan.cache_len * hd;
+    value_new_ptr = value_base + plan.cache_len * hd;
+  }
+
+  auto output_tensor = prepare_output_tensor(query_contig, output, fp32_output);
+
+  ExternalFMHAParams ext;
+  ext.query = reinterpret_cast<cutlass::bfloat16_t*>(query_contig.data_ptr<at::BFloat16>());
+  ext.key = key_new_ptr;
+  ext.value = value_new_ptr;
+  ext.key_cache = key_cache_ptr;
+  ext.value_cache = value_cache_ptr;
+  ext.output = fp32_output
+      ? static_cast<void*>(output_tensor.data_ptr<float>())
+      : static_cast<void*>(output_tensor.data_ptr<at::BFloat16>());
+  ext.batch = static_cast<int>(query_contig.size(0));
+  ext.num_heads_q = static_cast<int>(query_contig.size(1));
+  ext.num_heads_kv = static_cast<int>(key_contig.size(1));
+  ext.seq_len_q = static_cast<int>(query_contig.size(2));
+  ext.seq_len_kv = static_cast<int>(plan.kv_new_len);
+  ext.seq_len_kv_cache = static_cast<int>(plan.cache_len);
+  ext.parent_kv_total = static_cast<int>(parent_kv_total);
+  ext.head_dim = static_cast<int>(hd);
+  ext.softmax_scale = static_cast<float>(
+      scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(query_contig.size(3))));
+  ext.is_causal = plan.is_causal;
+  ext.device_id = query_contig.get_device();
+
+  std::vector<torch::Tensor> keepalive;
+  keepalive.reserve(4);
+  keepalive.push_back(query_contig);
+  keepalive.push_back(key_contig);
+  keepalive.push_back(value_contig);
+  keepalive.push_back(output_tensor);
+
+  return fp32_output
+      ? dispatch_prepare_sycl_tla_bf16<float>(query_contig.size(3), plan, ext, output_tensor, std::move(keepalive))
+      : dispatch_prepare_sycl_tla_bf16<cutlass::bfloat16_t>(query_contig.size(3), plan, ext, output_tensor, std::move(keepalive));
 }
 
 } // namespace
 
-torch::Tensor scaled_dot_product_attention_sycl(
+std::shared_ptr<PreparedScaledDotProductAttention> prepare_scaled_dot_product_attention_sycl(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value,
@@ -694,7 +1055,13 @@ torch::Tensor scaled_dot_product_attention_sycl(
     bool is_causal = false,
     std::optional<double> scale = std::nullopt,
     bool enable_gqa = false,
-    std::optional<std::string> output_dtype = std::nullopt) {
+    std::optional<std::string> output_dtype = std::nullopt,
+    std::optional<torch::Tensor> output = std::nullopt,
+    std::optional<int64_t> plan_cache_len = std::nullopt,
+    std::optional<int64_t> plan_kv_new_len = std::nullopt,
+    std::optional<bool> plan_is_causal = std::nullopt,
+    std::optional<bool> plan_is_decode = std::nullopt,
+    std::optional<bool> plan_use_sycl_tla = std::nullopt) {
   check_attention_inputs(query, key, value);
   TORCH_CHECK(dropout_p >= 0.0 && dropout_p < 1.0, "dropout_p must be in [0, 1)");
   TORCH_CHECK(
@@ -717,7 +1084,102 @@ torch::Tensor scaled_dot_product_attention_sycl(
         "key and value head count must match for enable_gqa=True");
   }
 
-  auto plan = build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
+  auto plan_override = build_execution_plan_override(
+      query,
+      key,
+      value,
+      dropout_p,
+      plan_cache_len,
+      plan_kv_new_len,
+      plan_is_causal,
+      plan_is_decode,
+      plan_use_sycl_tla);
+  auto plan = plan_override.has_value()
+      ? *plan_override
+      : build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
+
+  TORCH_CHECK(plan.use_sycl_tla, "prepare_scaled_dot_product_attention currently only supports the sycl-tla path");
+
+  const bool fp32_output_supported =
+      plan.use_sycl_tla && !plan.is_decode && query.size(3) == 128;
+
+  bool fp32_output = fp32_output_supported;
+  if (output_dtype.has_value()) {
+    const auto& d = *output_dtype;
+    if (d == "float32" || d == "fp32") {
+      TORCH_CHECK(
+          fp32_output_supported,
+          "output_dtype='float32' is currently only supported for prefill with head_dim=128 on the sycl-tla path");
+      fp32_output = true;
+    } else if (d == "bfloat16" || d == "bf16") {
+      fp32_output = false;
+    } else {
+      TORCH_CHECK(false, "sycl_ext flash_attention output_dtype must be one of {bfloat16, float32}, got: ", d);
+    }
+  }
+
+  return prepare_scaled_dot_product_attention_sycl_tla(query, key, value, plan, scale, fp32_output, output);
+}
+
+torch::Tensor run_prepared_scaled_dot_product_attention(
+    const std::shared_ptr<PreparedScaledDotProductAttention>& prepared) {
+  TORCH_CHECK(prepared != nullptr, "prepared flash attention handle must not be null");
+  sycl::queue& torch_q = c10::xpu::getCurrentXPUStream(prepared->device_id()).queue();
+  prepared->run(torch_q);
+  return prepared->output();
+}
+
+torch::Tensor scaled_dot_product_attention_sycl(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    std::optional<torch::Tensor> attn_mask = std::nullopt,
+    double dropout_p = 0.0,
+    bool is_causal = false,
+    std::optional<double> scale = std::nullopt,
+    bool enable_gqa = false,
+    std::optional<std::string> output_dtype = std::nullopt,
+    std::optional<torch::Tensor> output = std::nullopt,
+    std::optional<int64_t> plan_cache_len = std::nullopt,
+    std::optional<int64_t> plan_kv_new_len = std::nullopt,
+    std::optional<bool> plan_is_causal = std::nullopt,
+    std::optional<bool> plan_is_decode = std::nullopt,
+    std::optional<bool> plan_use_sycl_tla = std::nullopt) {
+  check_attention_inputs(query, key, value);
+  TORCH_CHECK(dropout_p >= 0.0 && dropout_p < 1.0, "dropout_p must be in [0, 1)");
+  TORCH_CHECK(
+      !(attn_mask.has_value() && is_causal),
+      "attn_mask and is_causal cannot both be set");
+
+  if (!enable_gqa) {
+    TORCH_CHECK(
+        query.size(1) == key.size(1),
+        "query and key head count must match unless enable_gqa=True");
+    TORCH_CHECK(
+        query.size(1) == value.size(1),
+        "query and value head count must match unless enable_gqa=True");
+  } else {
+    TORCH_CHECK(
+        query.size(1) % key.size(1) == 0,
+        "enable_gqa requires query heads to be divisible by key/value heads");
+    TORCH_CHECK(
+        key.size(1) == value.size(1),
+        "key and value head count must match for enable_gqa=True");
+  }
+
+  auto plan_override = build_execution_plan_override(
+      query,
+      key,
+      value,
+      dropout_p,
+      plan_cache_len,
+      plan_kv_new_len,
+      plan_is_causal,
+      plan_is_decode,
+      plan_use_sycl_tla);
+  auto plan = plan_override.has_value()
+      ? *plan_override
+      : build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
 
   // Paths whose FMHAConfigSelector specialization emits fp32 output via the
   // ElementO=float epilogue (currently: prefill + head_dim==128, no KV cache).
@@ -741,7 +1203,7 @@ torch::Tensor scaled_dot_product_attention_sycl(
   }
 
   if (plan.use_sycl_tla) {
-    return scaled_dot_product_attention_sycl_tla(query, key, value, plan, scale, fp32_output);
+    return scaled_dot_product_attention_sycl_tla(query, key, value, plan, scale, fp32_output, output);
   }
 
   if (enable_gqa) {
@@ -749,7 +1211,7 @@ torch::Tensor scaled_dot_product_attention_sycl(
     value = expand_gqa_heads(value, query.size(1));
   }
 
-  return scaled_dot_product_attention_fallback(
+  auto fallback_output = scaled_dot_product_attention_fallback(
       query,
       key,
       value,
@@ -757,9 +1219,21 @@ torch::Tensor scaled_dot_product_attention_sycl(
       dropout_p,
       is_causal,
       scale);
+
+  if (output.has_value()) {
+    auto out = prepare_output_tensor(query, output, false);
+    out.copy_(fallback_output);
+    return out;
+  }
+
+  return fallback_output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  pybind11::class_<PreparedScaledDotProductAttention, std::shared_ptr<PreparedScaledDotProductAttention>>(
+      m,
+      "PreparedScaledDotProductAttention");
+
   m.def(
       "scaled_dot_product_attention",
       &scaled_dot_product_attention_sycl,
@@ -772,5 +1246,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       pybind11::arg("scale") = pybind11::none(),
       pybind11::arg("enable_gqa") = false,
       pybind11::arg("output_dtype") = pybind11::none(),
+      pybind11::arg("output") = pybind11::none(),
+      pybind11::arg("plan_cache_len") = pybind11::none(),
+      pybind11::arg("plan_kv_new_len") = pybind11::none(),
+      pybind11::arg("plan_is_causal") = pybind11::none(),
+      pybind11::arg("plan_is_decode") = pybind11::none(),
+      pybind11::arg("plan_use_sycl_tla") = pybind11::none(),
       "SDPA-compatible flash attention exposed from sycl_ext with a sycl-tla-backed bf16 XPU path and ATen fallback.");
+
+  m.def(
+      "prepare_scaled_dot_product_attention",
+      &prepare_scaled_dot_product_attention_sycl,
+      pybind11::arg("query"),
+      pybind11::arg("key"),
+      pybind11::arg("value"),
+      pybind11::arg("attn_mask") = pybind11::none(),
+      pybind11::arg("dropout_p") = 0.0,
+      pybind11::arg("is_causal") = false,
+      pybind11::arg("scale") = pybind11::none(),
+      pybind11::arg("enable_gqa") = false,
+      pybind11::arg("output_dtype") = pybind11::none(),
+      pybind11::arg("output") = pybind11::none(),
+      pybind11::arg("plan_cache_len") = pybind11::none(),
+      pybind11::arg("plan_kv_new_len") = pybind11::none(),
+      pybind11::arg("plan_is_causal") = pybind11::none(),
+      pybind11::arg("plan_is_decode") = pybind11::none(),
+      pybind11::arg("plan_use_sycl_tla") = pybind11::none(),
+      "Prepare and cache the sycl-tla FMHA launch state for repeated execution.");
+
+  m.def(
+      "run_prepared_scaled_dot_product_attention",
+      &run_prepared_scaled_dot_product_attention,
+      pybind11::arg("prepared"),
+      "Launch a previously prepared sycl-tla FMHA operation on the current XPU stream.");
 }

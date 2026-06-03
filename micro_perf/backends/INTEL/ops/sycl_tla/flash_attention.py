@@ -21,7 +21,6 @@ try:
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
             self._provider = "sycl_tla_flash_attention"
-            self.extra_providers = ["sycl_tla_flash_attention"]
 
 
 except Exception as e:

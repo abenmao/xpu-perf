@@ -14,6 +14,16 @@ _SYCL_EXT_SO = os.path.join(
 _sycl_ext = None
 
 
+def ensure_extension_artifact_exists():
+    if not os.path.isfile(_SYCL_EXT_SO):
+        raise FileNotFoundError(
+            f"sycl_ext shared object not found: {_SYCL_EXT_SO}. "
+            "Build it with micro_perf/backends/INTEL/ops/sycl_ext/build.sh first."
+        )
+
+    return _SYCL_EXT_SO
+
+
 def _preload_torch_shared_libs():
     if os.name != "posix":
         return
@@ -30,11 +40,7 @@ def _preload_torch_shared_libs():
 
 
 def _load_extension():
-    if not os.path.isfile(_SYCL_EXT_SO):
-        raise FileNotFoundError(
-            f"sycl_ext shared object not found: {_SYCL_EXT_SO}. "
-            "Build it with micro_perf/backends/INTEL/ops/sycl_ext/build.sh first."
-        )
+    ensure_extension_artifact_exists()
 
     _preload_torch_shared_libs()
 

@@ -25,7 +25,6 @@
 
 namespace {
 
-using torch::indexing::Slice;
 using namespace cute;
 
 int cached_sm_count(int device_id) {
@@ -169,8 +168,15 @@ struct ExternalFMHAParams {
   int parent_kv_total = 0;
   int head_dim = 0;
   float softmax_scale = 0.0f;
-  bool is_causal = false;
   int device_id = 0;
+};
+
+struct SyclTlaLaunchContext {
+  torch::Tensor query_contig;
+  torch::Tensor key_contig;
+  torch::Tensor value_contig;
+  torch::Tensor output_tensor;
+  ExternalFMHAParams ext;
 };
 
 template <cutlass::flash_attention::FMHAMode Mode,
@@ -543,6 +549,166 @@ torch::Tensor prepare_output_tensor(
       : torch::empty_like(query);
 }
 
+void check_scaled_dot_product_attention_arguments(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& attn_mask,
+    double dropout_p,
+    bool is_causal,
+    bool enable_gqa) {
+  check_attention_inputs(query, key, value);
+  TORCH_CHECK(dropout_p >= 0.0 && dropout_p < 1.0, "dropout_p must be in [0, 1)");
+  TORCH_CHECK(
+      !(attn_mask.has_value() && is_causal),
+      "attn_mask and is_causal cannot both be set");
+
+  if (!enable_gqa) {
+    TORCH_CHECK(
+        query.size(1) == key.size(1),
+        "query and key head count must match unless enable_gqa=True");
+    TORCH_CHECK(
+        query.size(1) == value.size(1),
+        "query and value head count must match unless enable_gqa=True");
+  } else {
+    TORCH_CHECK(
+        query.size(1) % key.size(1) == 0,
+        "enable_gqa requires query heads to be divisible by key/value heads");
+    TORCH_CHECK(
+        key.size(1) == value.size(1),
+        "key and value head count must match for enable_gqa=True");
+  }
+}
+
+SyclTlaExecutionPlan resolve_execution_plan(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& attn_mask,
+    double dropout_p,
+    bool is_causal,
+    const std::optional<int64_t>& plan_cache_len,
+    const std::optional<int64_t>& plan_kv_new_len,
+    const std::optional<bool>& plan_is_causal,
+    const std::optional<bool>& plan_is_decode,
+    const std::optional<bool>& plan_use_sycl_tla) {
+  auto plan_override = build_execution_plan_override(
+      query,
+      key,
+      value,
+      dropout_p,
+      plan_cache_len,
+      plan_kv_new_len,
+      plan_is_causal,
+      plan_is_decode,
+      plan_use_sycl_tla);
+  return plan_override.has_value()
+      ? *plan_override
+      : build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
+}
+
+bool resolve_fp32_output(
+    const SyclTlaExecutionPlan& plan,
+    int64_t head_dim,
+    const std::optional<std::string>& output_dtype) {
+  const bool fp32_output_supported =
+      plan.use_sycl_tla && !plan.is_decode && head_dim == 128;
+
+  bool fp32_output = fp32_output_supported;
+  if (output_dtype.has_value()) {
+    const auto& d = *output_dtype;
+    if (d == "float32" || d == "fp32") {
+      TORCH_CHECK(
+          fp32_output_supported,
+          "output_dtype='float32' is currently only supported for prefill with head_dim=128 on the sycl-tla path");
+      fp32_output = true;
+    } else if (d == "bfloat16" || d == "bf16") {
+      fp32_output = false;
+    } else {
+      TORCH_CHECK(
+          false,
+          "sycl_ext flash_attention output_dtype must be one of {bfloat16, float32}, got: ",
+          d);
+    }
+  }
+
+  return fp32_output;
+}
+
+float resolve_softmax_scale(
+    const torch::Tensor& query,
+    const std::optional<double>& scale) {
+  return static_cast<float>(
+      scale.has_value()
+          ? *scale
+          : 1.0 / std::sqrt(static_cast<double>(query.size(3))));
+}
+
+SyclTlaLaunchContext build_sycl_tla_launch_context(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const SyclTlaExecutionPlan& plan,
+    const std::optional<double>& scale,
+    bool fp32_output,
+    const std::optional<torch::Tensor>& output) {
+  SyclTlaLaunchContext context;
+  context.query_contig = query.is_contiguous() ? query : query.contiguous();
+  context.key_contig = key.is_contiguous() ? key : key.contiguous();
+  context.value_contig = value.is_contiguous() ? value : value.contiguous();
+  context.output_tensor = prepare_output_tensor(context.query_contig, output, fp32_output);
+
+  const int64_t parent_kv_total = context.key_contig.size(2);
+  const int64_t head_dim = context.query_contig.size(3);
+  auto* key_base = reinterpret_cast<cutlass::bfloat16_t*>(
+      context.key_contig.data_ptr<at::BFloat16>());
+  auto* value_base = reinterpret_cast<cutlass::bfloat16_t*>(
+      context.value_contig.data_ptr<at::BFloat16>());
+  auto* key_new_ptr = key_base;
+  auto* value_new_ptr = value_base;
+  cutlass::bfloat16_t* key_cache_ptr = nullptr;
+  cutlass::bfloat16_t* value_cache_ptr = nullptr;
+
+  if (plan.cache_len > 0) {
+    key_cache_ptr = key_base;
+    value_cache_ptr = value_base;
+    key_new_ptr = key_base + plan.cache_len * head_dim;
+    value_new_ptr = value_base + plan.cache_len * head_dim;
+  }
+
+  context.ext.query = reinterpret_cast<cutlass::bfloat16_t*>(
+      context.query_contig.data_ptr<at::BFloat16>());
+  context.ext.key = key_new_ptr;
+  context.ext.value = value_new_ptr;
+  context.ext.key_cache = key_cache_ptr;
+  context.ext.value_cache = value_cache_ptr;
+  context.ext.output = fp32_output
+      ? static_cast<void*>(context.output_tensor.data_ptr<float>())
+      : static_cast<void*>(context.output_tensor.data_ptr<at::BFloat16>());
+  context.ext.batch = static_cast<int>(context.query_contig.size(0));
+  context.ext.num_heads_q = static_cast<int>(context.query_contig.size(1));
+  context.ext.num_heads_kv = static_cast<int>(context.key_contig.size(1));
+  context.ext.seq_len_q = static_cast<int>(context.query_contig.size(2));
+  context.ext.seq_len_kv = static_cast<int>(plan.kv_new_len);
+  context.ext.seq_len_kv_cache = static_cast<int>(plan.cache_len);
+  context.ext.parent_kv_total = static_cast<int>(parent_kv_total);
+  context.ext.head_dim = static_cast<int>(head_dim);
+  context.ext.softmax_scale = resolve_softmax_scale(context.query_contig, scale);
+  context.ext.device_id = context.query_contig.get_device();
+
+  return context;
+}
+
+std::vector<torch::Tensor> build_keepalive_tensors(
+    const SyclTlaLaunchContext& context) {
+  return {
+      context.query_contig,
+      context.key_contig,
+      context.value_contig,
+      context.output_tensor,
+  };
+}
+
 template <class FMHAKernel>
 void launch_fmha(typename FMHAKernel::Params params, sycl::queue q) {
   namespace syclex = sycl::ext::oneapi::experimental;
@@ -722,10 +888,6 @@ cutlass::Status run_sycl_tla_bf16(const ExternalFMHAParams& ext) {
   hw_info.sm_count = cached_sm_count(ext.device_id);
 
   auto shape_q = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
-  auto shape_k = cute::make_shape(ext.seq_len_kv, ext.head_dim, ext.num_heads_kv, ext.batch);
-  auto shape_v = cute::make_shape(ext.head_dim, ext.seq_len_kv, ext.num_heads_kv, ext.batch);
-  auto shape_k_cache = cute::make_shape(ext.seq_len_kv_cache, ext.head_dim, ext.num_heads_kv, ext.batch);
-  auto shape_v_cache = cute::make_shape(ext.head_dim, ext.seq_len_kv_cache, ext.num_heads_kv, ext.batch);
   auto shape_o = cute::make_shape(ext.seq_len_q, ext.head_dim, ext.num_heads_q, ext.batch);
 
   // K/V layouts use the parent buffer's kv-total dim to compute head/batch
@@ -921,64 +1083,25 @@ torch::Tensor scaled_dot_product_attention_sycl_tla(
     const torch::Tensor& value,
     const SyclTlaExecutionPlan& plan,
     std::optional<double> scale,
-  bool fp32_output,
-  const std::optional<torch::Tensor>& output) {
-  auto query_contig = query.is_contiguous() ? query : query.contiguous();
-  auto key_contig = key.is_contiguous() ? key : key.contiguous();
-  auto value_contig = value.is_contiguous() ? value : value.contiguous();
-
-  // For the KV-cache path, K/V live in the same parent buffer
-  // [batch, num_heads_kv, parent_kv_total, head_dim] (contiguous). We avoid
-  // a costly .contiguous() copy of the cached slice (which on long-context
-  // workloads is hundreds of MB per call) by passing pointer offsets and
-  // setting parent_kv_total so run_sycl_tla_bf16 uses parent strides for
-  // head/batch dims while still reading only seq_len_kv_cache / kv_new_len
-  // rows from the kv dim.
-  const int64_t parent_kv_total = key_contig.size(2);
-  const int64_t hd = query_contig.size(3);
-  cutlass::bfloat16_t* key_base = reinterpret_cast<cutlass::bfloat16_t*>(key_contig.data_ptr<at::BFloat16>());
-  cutlass::bfloat16_t* value_base = reinterpret_cast<cutlass::bfloat16_t*>(value_contig.data_ptr<at::BFloat16>());
-  cutlass::bfloat16_t* key_new_ptr = key_base;
-  cutlass::bfloat16_t* value_new_ptr = value_base;
-  cutlass::bfloat16_t* key_cache_ptr = nullptr;
-  cutlass::bfloat16_t* value_cache_ptr = nullptr;
-  if (plan.cache_len > 0) {
-    key_cache_ptr = key_base;
-    value_cache_ptr = value_base;
-    // K_new / V_new start at kv-offset = cache_len within the parent buffer
-    // (PyTorch layout is [b, h, kv, d] contiguous, so the kv-stride is hd).
-    key_new_ptr = key_base + plan.cache_len * hd;
-    value_new_ptr = value_base + plan.cache_len * hd;
-  }
-
-    auto output_tensor = prepare_output_tensor(query_contig, output, fp32_output);
-
-  ExternalFMHAParams ext;
-  ext.query = reinterpret_cast<cutlass::bfloat16_t*>(query_contig.data_ptr<at::BFloat16>());
-  ext.key = key_new_ptr;
-  ext.value = value_new_ptr;
-  ext.key_cache = key_cache_ptr;
-  ext.value_cache = value_cache_ptr;
-    ext.output = fp32_output
-      ? static_cast<void*>(output_tensor.data_ptr<float>())
-      : static_cast<void*>(output_tensor.data_ptr<at::BFloat16>());
-  ext.batch = static_cast<int>(query_contig.size(0));
-  ext.num_heads_q = static_cast<int>(query_contig.size(1));
-  ext.num_heads_kv = static_cast<int>(key_contig.size(1));
-  ext.seq_len_q = static_cast<int>(query_contig.size(2));
-  ext.seq_len_kv = static_cast<int>(plan.kv_new_len);
-  ext.seq_len_kv_cache = static_cast<int>(plan.cache_len);
-  ext.parent_kv_total = static_cast<int>(parent_kv_total);
-  ext.head_dim = static_cast<int>(hd);
-  ext.softmax_scale = static_cast<float>(scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(query_contig.size(3))));
-  ext.is_causal = plan.is_causal;
-  ext.device_id = query_contig.get_device();
+    bool fp32_output,
+    const std::optional<torch::Tensor>& output) {
+  auto context = build_sycl_tla_launch_context(
+      query,
+      key,
+      value,
+      plan,
+      scale,
+      fp32_output,
+      output);
 
   auto status = fp32_output
-      ? dispatch_sycl_tla_bf16<float>(query_contig.size(3), plan, ext)
-      : dispatch_sycl_tla_bf16<cutlass::bfloat16_t>(query_contig.size(3), plan, ext);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "sycl-tla flash attention launch failed with status code ", static_cast<int>(status));
-  return output_tensor;
+      ? dispatch_sycl_tla_bf16<float>(context.ext.head_dim, plan, context.ext)
+      : dispatch_sycl_tla_bf16<cutlass::bfloat16_t>(context.ext.head_dim, plan, context.ext);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "sycl-tla flash attention launch failed with status code ",
+      static_cast<int>(status));
+  return context.output_tensor;
 }
 
 std::shared_ptr<PreparedScaledDotProductAttention> prepare_scaled_dot_product_attention_sycl_tla(
@@ -989,59 +1112,19 @@ std::shared_ptr<PreparedScaledDotProductAttention> prepare_scaled_dot_product_at
     std::optional<double> scale,
     bool fp32_output,
     const std::optional<torch::Tensor>& output) {
-  auto query_contig = query.is_contiguous() ? query : query.contiguous();
-  auto key_contig = key.is_contiguous() ? key : key.contiguous();
-  auto value_contig = value.is_contiguous() ? value : value.contiguous();
-
-  const int64_t parent_kv_total = key_contig.size(2);
-  const int64_t hd = query_contig.size(3);
-  cutlass::bfloat16_t* key_base = reinterpret_cast<cutlass::bfloat16_t*>(key_contig.data_ptr<at::BFloat16>());
-  cutlass::bfloat16_t* value_base = reinterpret_cast<cutlass::bfloat16_t*>(value_contig.data_ptr<at::BFloat16>());
-  cutlass::bfloat16_t* key_new_ptr = key_base;
-  cutlass::bfloat16_t* value_new_ptr = value_base;
-  cutlass::bfloat16_t* key_cache_ptr = nullptr;
-  cutlass::bfloat16_t* value_cache_ptr = nullptr;
-  if (plan.cache_len > 0) {
-    key_cache_ptr = key_base;
-    value_cache_ptr = value_base;
-    key_new_ptr = key_base + plan.cache_len * hd;
-    value_new_ptr = value_base + plan.cache_len * hd;
-  }
-
-  auto output_tensor = prepare_output_tensor(query_contig, output, fp32_output);
-
-  ExternalFMHAParams ext;
-  ext.query = reinterpret_cast<cutlass::bfloat16_t*>(query_contig.data_ptr<at::BFloat16>());
-  ext.key = key_new_ptr;
-  ext.value = value_new_ptr;
-  ext.key_cache = key_cache_ptr;
-  ext.value_cache = value_cache_ptr;
-  ext.output = fp32_output
-      ? static_cast<void*>(output_tensor.data_ptr<float>())
-      : static_cast<void*>(output_tensor.data_ptr<at::BFloat16>());
-  ext.batch = static_cast<int>(query_contig.size(0));
-  ext.num_heads_q = static_cast<int>(query_contig.size(1));
-  ext.num_heads_kv = static_cast<int>(key_contig.size(1));
-  ext.seq_len_q = static_cast<int>(query_contig.size(2));
-  ext.seq_len_kv = static_cast<int>(plan.kv_new_len);
-  ext.seq_len_kv_cache = static_cast<int>(plan.cache_len);
-  ext.parent_kv_total = static_cast<int>(parent_kv_total);
-  ext.head_dim = static_cast<int>(hd);
-  ext.softmax_scale = static_cast<float>(
-      scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(query_contig.size(3))));
-  ext.is_causal = plan.is_causal;
-  ext.device_id = query_contig.get_device();
-
-  std::vector<torch::Tensor> keepalive;
-  keepalive.reserve(4);
-  keepalive.push_back(query_contig);
-  keepalive.push_back(key_contig);
-  keepalive.push_back(value_contig);
-  keepalive.push_back(output_tensor);
+  auto context = build_sycl_tla_launch_context(
+    query,
+    key,
+    value,
+    plan,
+    scale,
+    fp32_output,
+    output);
+  auto keepalive = build_keepalive_tensors(context);
 
   return fp32_output
-      ? dispatch_prepare_sycl_tla_bf16<float>(query_contig.size(3), plan, ext, output_tensor, std::move(keepalive))
-      : dispatch_prepare_sycl_tla_bf16<cutlass::bfloat16_t>(query_contig.size(3), plan, ext, output_tensor, std::move(keepalive));
+    ? dispatch_prepare_sycl_tla_bf16<float>(context.ext.head_dim, plan, context.ext, context.output_tensor, std::move(keepalive))
+    : dispatch_prepare_sycl_tla_bf16<cutlass::bfloat16_t>(context.ext.head_dim, plan, context.ext, context.output_tensor, std::move(keepalive));
 }
 
 } // namespace
@@ -1062,61 +1145,31 @@ std::shared_ptr<PreparedScaledDotProductAttention> prepare_scaled_dot_product_at
     std::optional<bool> plan_is_causal = std::nullopt,
     std::optional<bool> plan_is_decode = std::nullopt,
     std::optional<bool> plan_use_sycl_tla = std::nullopt) {
-  check_attention_inputs(query, key, value);
-  TORCH_CHECK(dropout_p >= 0.0 && dropout_p < 1.0, "dropout_p must be in [0, 1)");
-  TORCH_CHECK(
-      !(attn_mask.has_value() && is_causal),
-      "attn_mask and is_causal cannot both be set");
-
-  if (!enable_gqa) {
-    TORCH_CHECK(
-        query.size(1) == key.size(1),
-        "query and key head count must match unless enable_gqa=True");
-    TORCH_CHECK(
-        query.size(1) == value.size(1),
-        "query and value head count must match unless enable_gqa=True");
-  } else {
-    TORCH_CHECK(
-        query.size(1) % key.size(1) == 0,
-        "enable_gqa requires query heads to be divisible by key/value heads");
-    TORCH_CHECK(
-        key.size(1) == value.size(1),
-        "key and value head count must match for enable_gqa=True");
-  }
-
-  auto plan_override = build_execution_plan_override(
+  check_scaled_dot_product_attention_arguments(
       query,
       key,
       value,
+      attn_mask,
       dropout_p,
+      is_causal,
+      enable_gqa);
+
+  auto plan = resolve_execution_plan(
+      query,
+      key,
+      value,
+      attn_mask,
+      dropout_p,
+      is_causal,
       plan_cache_len,
       plan_kv_new_len,
       plan_is_causal,
       plan_is_decode,
       plan_use_sycl_tla);
-  auto plan = plan_override.has_value()
-      ? *plan_override
-      : build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
 
   TORCH_CHECK(plan.use_sycl_tla, "prepare_scaled_dot_product_attention currently only supports the sycl-tla path");
 
-  const bool fp32_output_supported =
-      plan.use_sycl_tla && !plan.is_decode && query.size(3) == 128;
-
-  bool fp32_output = fp32_output_supported;
-  if (output_dtype.has_value()) {
-    const auto& d = *output_dtype;
-    if (d == "float32" || d == "fp32") {
-      TORCH_CHECK(
-          fp32_output_supported,
-          "output_dtype='float32' is currently only supported for prefill with head_dim=128 on the sycl-tla path");
-      fp32_output = true;
-    } else if (d == "bfloat16" || d == "bf16") {
-      fp32_output = false;
-    } else {
-      TORCH_CHECK(false, "sycl_ext flash_attention output_dtype must be one of {bfloat16, float32}, got: ", d);
-    }
-  }
+  auto fp32_output = resolve_fp32_output(plan, query.size(3), output_dtype);
 
   return prepare_scaled_dot_product_attention_sycl_tla(query, key, value, plan, scale, fp32_output, output);
 }
@@ -1145,62 +1198,28 @@ torch::Tensor scaled_dot_product_attention_sycl(
     std::optional<bool> plan_is_causal = std::nullopt,
     std::optional<bool> plan_is_decode = std::nullopt,
     std::optional<bool> plan_use_sycl_tla = std::nullopt) {
-  check_attention_inputs(query, key, value);
-  TORCH_CHECK(dropout_p >= 0.0 && dropout_p < 1.0, "dropout_p must be in [0, 1)");
-  TORCH_CHECK(
-      !(attn_mask.has_value() && is_causal),
-      "attn_mask and is_causal cannot both be set");
-
-  if (!enable_gqa) {
-    TORCH_CHECK(
-        query.size(1) == key.size(1),
-        "query and key head count must match unless enable_gqa=True");
-    TORCH_CHECK(
-        query.size(1) == value.size(1),
-        "query and value head count must match unless enable_gqa=True");
-  } else {
-    TORCH_CHECK(
-        query.size(1) % key.size(1) == 0,
-        "enable_gqa requires query heads to be divisible by key/value heads");
-    TORCH_CHECK(
-        key.size(1) == value.size(1),
-        "key and value head count must match for enable_gqa=True");
-  }
-
-  auto plan_override = build_execution_plan_override(
+  check_scaled_dot_product_attention_arguments(
       query,
       key,
       value,
+      attn_mask,
       dropout_p,
+      is_causal,
+      enable_gqa);
+
+  auto plan = resolve_execution_plan(
+      query,
+      key,
+      value,
+      attn_mask,
+      dropout_p,
+      is_causal,
       plan_cache_len,
       plan_kv_new_len,
       plan_is_causal,
       plan_is_decode,
       plan_use_sycl_tla);
-  auto plan = plan_override.has_value()
-      ? *plan_override
-      : build_execution_plan(query, key, value, attn_mask, dropout_p, is_causal);
-
-  // Paths whose FMHAConfigSelector specialization emits fp32 output via the
-  // ElementO=float epilogue (currently: prefill + head_dim==128, no KV cache).
-  // On these paths the in-kernel fp32->bf16 conversion is avoided, matching
-  // the sycl-tla 06 binary's throughput (~8% faster).
-  const bool fp32_output_supported =
-      plan.use_sycl_tla && !plan.is_decode && query.size(3) == 128;
-
-  bool fp32_output = fp32_output_supported;  // default: fp32 wherever supported
-  if (output_dtype.has_value()) {
-    const auto& d = *output_dtype;
-    if (d == "float32" || d == "fp32") {
-      TORCH_CHECK(fp32_output_supported,
-                  "output_dtype='float32' is currently only supported for prefill with head_dim=128 on the sycl-tla path");
-      fp32_output = true;
-    } else if (d == "bfloat16" || d == "bf16") {
-      fp32_output = false;
-    } else {
-      TORCH_CHECK(false, "sycl_ext flash_attention output_dtype must be one of {bfloat16, float32}, got: ", d);
-    }
-  }
+  auto fp32_output = resolve_fp32_output(plan, query.size(3), output_dtype);
 
   if (plan.use_sycl_tla) {
     return scaled_dot_product_attention_sycl_tla(query, key, value, plan, scale, fp32_output, output);

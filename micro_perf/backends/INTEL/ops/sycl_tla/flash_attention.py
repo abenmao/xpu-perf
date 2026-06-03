@@ -10,12 +10,12 @@ sys.path.insert(
 from core.op import ProviderRegistry
 
 try:
-    from backends.INTEL.ops.sycl_ext.flash_attention_provider import (
-        SYCLExtFlashAttentionOp,
+    from backends.INTEL.ops.sycl_ext.flash_attention_impl import (
+        SYCLExtFlashAttentionImpl,
     )
 
     @ProviderRegistry.register_vendor_impl("flash_attention", "sycl_tla_flash_attention")
-    class SyclTlaFAOp(SYCLExtFlashAttentionOp):
+    class SyclTlaFAOp(SYCLExtFlashAttentionImpl):
         """Compatibility provider that keeps the sycl_tla name on top of sycl_ext."""
 
         def __init__(self, args_dict, backend, *args, **kwargs):

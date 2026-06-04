@@ -29,6 +29,10 @@ def _is_xccl_op(op_instance):
     return getattr(op_instance.__class__, "__module__", "").endswith("core.ops.xccl_ops")
 
 
+def _is_flash_attention_op(op_instance):
+    return any(cls.__name__ == "FlashAttentionOp" for cls in type(op_instance).__mro__)
+
+
 def _has_cpu_tensor(op_instance):
     for tensors in (getattr(op_instance, "input_tensor_info", {}),
                     getattr(op_instance, "output_tensor_info", {})):
@@ -41,6 +45,12 @@ def _has_cpu_tensor(op_instance):
 def _should_throttle(op_instance):
     size = getattr(op_instance, "tensor_size", 0)
     return size >= _BCS_THRESHOLD and (_is_xccl_op(op_instance) or _has_cpu_tensor(op_instance))
+
+
+def _min_test_iters(op_instance):
+    if _is_flash_attention_op(op_instance):
+        return 100
+    return 3 if _should_throttle(op_instance) else 10
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +71,7 @@ def run_perf(backend, op_instance):
 
     try:
         # --- iter / data-cnt caps ---
-        min_iters = 3 if _should_throttle(op_instance) else 10
+        min_iters = _min_test_iters(op_instance)
         max_data_cnt = 1
         if not op_instance.is_concurrent:
             if tensor_size > assume_avail:
